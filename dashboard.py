@@ -181,18 +181,31 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 30:
             st.session_state["price_history"].pop(0)
 
-        # Dynamic Trend & Option Type Calculation based on Price History
-        if len(st.session_state["price_history"]) >= 2:
-            prev_price = st.session_state["price_history"][-2]
-            if spot_ltp < prev_price:
+        # Robust Trend & Option Type Calculation
+        # Agar price pichle data ke rolling average se neeche hai ya drop ho raha hai toh BEARISH rahega
+        if len(st.session_state["price_history"]) >= 4:
+            past_prices = st.session_state["price_history"][:-1]
+            past_avg = sum(past_prices) / len(past_prices)
+            recent_delta = spot_ltp - past_prices[-1]
+            
+            # Agar spot average se neeche hai ya recent trend downward hai
+            if spot_ltp <= past_avg or recent_delta <= 0:
+                market_dir = MarketDirection.BEARISH
+                chosen_opt_type = OptionType.PE
+            else:
+                market_dir = MarketDirection.BULLISH
+                chosen_opt_type = OptionType.CE
+        elif len(st.session_state["price_history"]) >= 2:
+            if spot_ltp <= st.session_state["price_history"][-2]:
                 market_dir = MarketDirection.BEARISH
                 chosen_opt_type = OptionType.PE
             else:
                 market_dir = MarketDirection.BULLISH
                 chosen_opt_type = OptionType.CE
         else:
-            market_dir = MarketDirection.BULLISH
-            chosen_opt_type = OptionType.CE
+            # Default first tick setting
+            market_dir = MarketDirection.BEARISH
+            chosen_opt_type = OptionType.PE
 
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
