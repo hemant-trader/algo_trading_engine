@@ -101,7 +101,6 @@ trade_mode = st.sidebar.radio(
 
 st.sidebar.markdown("---")
 
-# Index selection with explicit state index mapping
 index_keys = list(INDEX_CONFIG.keys())
 saved_idx_pos = index_keys.index(st.session_state["selected_index"]) if st.session_state["selected_index"] in index_keys else 0
 
@@ -112,7 +111,6 @@ selected_index = st.sidebar.selectbox(
     key="selected_index_dropdown"
 )
 
-# Agar user dropdown badalta hai toh state update karein aur purane candidate tracker ko reset karein
 if selected_index != st.session_state["selected_index"]:
     st.session_state["selected_index"] = selected_index
     st.session_state["price_history"] = []
@@ -182,13 +180,11 @@ if "access_token" in st.session_state:
             st.session_state["price_history"].pop(0)
 
         # Robust Trend & Option Type Calculation
-        # Agar price pichle data ke rolling average se neeche hai ya drop ho raha hai toh BEARISH rahega
         if len(st.session_state["price_history"]) >= 4:
             past_prices = st.session_state["price_history"][:-1]
             past_avg = sum(past_prices) / len(past_prices)
             recent_delta = spot_ltp - past_prices[-1]
             
-            # Agar spot average se neeche hai ya recent trend downward hai
             if spot_ltp <= past_avg or recent_delta <= 0:
                 market_dir = MarketDirection.BEARISH
                 chosen_opt_type = OptionType.PE
@@ -203,7 +199,6 @@ if "access_token" in st.session_state:
                 market_dir = MarketDirection.BULLISH
                 chosen_opt_type = OptionType.CE
         else:
-            # Default first tick setting
             market_dir = MarketDirection.BEARISH
             chosen_opt_type = OptionType.PE
 
@@ -213,7 +208,6 @@ if "access_token" in st.session_state:
         current_time = time.time()
         sample_opt_price = 145.0
         
-        # Clean Dynamic Symbol naming based on selected index
         symbol_prefix = selected_index.replace(" ", "").upper()
         clean_symbol = f"{symbol_prefix}_{int(atm_strike)}_{chosen_opt_type.value}"
 
@@ -266,8 +260,25 @@ if "access_token" in st.session_state:
             max_spread_pct=0.02
         )
 
-        final_action = f"BUY {candidate.option_type.value}" if passed else "NO TRADE"
-        action_color = "#2ecc71" if passed else "#f1c40f"
+        # ---------------- CHANCE OF WINNING (POP) CALCULATION ----------------
+        base_pop = abs(greeks.delta) * 100.0
+        oi_adjustment = (oi_score / 20.0) * 5.0
+        win_chance = min(max(base_pop + oi_adjustment, 15.0), 88.0)
+        
+        if win_chance >= 50.0:
+            win_color = "#2ecc71"
+        elif win_chance >= 40.0:
+            win_color = "#f1c40f"
+        else:
+            win_color = "#e74c3c"
+
+        # Action Colors: BUY PE -> Red, BUY CE -> Green, NO TRADE -> Yellow
+        if passed:
+            final_action = f"BUY {candidate.option_type.value}"
+            action_color = "#ff4b4b" if candidate.option_type == OptionType.PE else "#2ecc71"
+        else:
+            final_action = "NO TRADE"
+            action_color = "#f1c40f"
 
         col_metric, col_signal_card = st.columns([2, 1])
 
@@ -285,12 +296,16 @@ if "access_token" in st.session_state:
         with col_signal_card:
             st.markdown(
                 f"""
-                <div style="background-color:#1e222d; padding:25px; border-radius:10px; text-align:center; border: 1px solid #363c4e;">
-                    <h3 style="color:#b2b9c7; margin-bottom: 5px;">⚡ Engine Signal</h3>
-                    <h1 style="color:{action_color}; font-size: 34px; margin-top:5px;">{final_action}</h1>
-                    <p style="color:#848d9c; margin-bottom: 2px;">Direction: <b>{market_dir.name}</b></p>
-                    <p style="color:#848d9c; margin-bottom: 2px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
-                    <p style="color:#57606a; font-size: 13px;">Gate Status: {gate_msg}</p>
+                <div style="background-color:#1e222d; padding:22px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
+                    <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
+                    <h1 style="color:{action_color}; font-size: 34px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
+                    <div style="background-color:#14171f; padding:8px 12px; border-radius:8px; margin-bottom:10px; display:inline-block; border:1px solid #2a2e39;">
+                        <span style="color:#848d9c; font-size:13px;">Chance of Winning: </span>
+                        <b style="color:{win_color}; font-size:16px;">{win_chance:.1f}%</b>
+                    </div>
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Direction: <b>{market_dir.name}</b></p>
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
+                    <p style="color:#57606a; font-size: 12px; margin-top: 4px;">Gate Status: {gate_msg}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
