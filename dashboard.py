@@ -112,10 +112,11 @@ selected_index = st.sidebar.selectbox(
     key="selected_index_dropdown"
 )
 
-# Agar user dropdown badalta hai toh state update karein aur history flush karein
+# Agar user dropdown badalta hai toh state update karein aur purane candidate tracker ko reset karein
 if selected_index != st.session_state["selected_index"]:
     st.session_state["selected_index"] = selected_index
     st.session_state["price_history"] = []
+    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_threshold=5.0, min_confirmations=3)
     st.rerun()
 
 step_val = INDEX_CONFIG[selected_index]["step"]
@@ -153,6 +154,7 @@ else:
             os.remove(TOKEN_FILE)
         del st.session_state["access_token"]
         st.session_state["price_history"] = []
+        st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_threshold=5.0, min_confirmations=3)
         st.rerun()
 
 # ================= MAIN DASHBOARD UI =================
@@ -179,17 +181,35 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 30:
             st.session_state["price_history"].pop(0)
 
+        # Dynamic Trend & Option Type Calculation based on Price History
+        if len(st.session_state["price_history"]) >= 2:
+            prev_price = st.session_state["price_history"][-2]
+            if spot_ltp < prev_price:
+                market_dir = MarketDirection.BEARISH
+                chosen_opt_type = OptionType.PE
+            else:
+                market_dir = MarketDirection.BULLISH
+                chosen_opt_type = OptionType.CE
+        else:
+            market_dir = MarketDirection.BULLISH
+            chosen_opt_type = OptionType.CE
+
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
 
         current_time = time.time()
         sample_opt_price = 145.0
+        
+        # Clean Dynamic Symbol naming based on selected index
+        symbol_prefix = selected_index.replace(" ", "").upper()
+        clean_symbol = f"{symbol_prefix}_{int(atm_strike)}_{chosen_opt_type.value}"
+
         tick = NormalizedOptionTick(
-            symbol=f"{selected_index.replace(' ', '')}STRIKE{int(atm_strike)}CE",
+            symbol=clean_symbol,
             underlying=selected_index,
             expiry="2026-09-17",
             strike=float(atm_strike),
-            option_type=OptionType.CE,
+            option_type=chosen_opt_type,
             ltp=sample_opt_price,
             bid=sample_opt_price - 0.20,
             ask=sample_opt_price + 0.20,
@@ -198,7 +218,7 @@ if "access_token" in st.session_state:
             oi=110000,
             volume_change=3000,
             oi_change=12000,
-            price_change=8.5,
+            price_change=8.5 if chosen_opt_type == OptionType.CE else -8.5,
             price_change_pct=6.2,
             oi_change_pct=11.5,
             timestamp=current_time,
@@ -206,7 +226,6 @@ if "access_token" in st.session_state:
             tte=0.015
         )
 
-        market_dir = MarketDirection.BULLISH
         is_valid_tick, _ = st.session_state["tick_guard"].validate_tick(tick, current_time)
         st.session_state["ttl_manager"].pulse(is_valid_tick)
 
@@ -256,6 +275,7 @@ if "access_token" in st.session_state:
                 <div style="background-color:#1e222d; padding:25px; border-radius:10px; text-align:center; border: 1px solid #363c4e;">
                     <h3 style="color:#b2b9c7; margin-bottom: 5px;">⚡ Engine Signal</h3>
                     <h1 style="color:{action_color}; font-size: 34px; margin-top:5px;">{final_action}</h1>
+                    <p style="color:#848d9c; margin-bottom: 2px;">Direction: <b>{market_dir.name}</b></p>
                     <p style="color:#848d9c; margin-bottom: 2px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
                     <p style="color:#57606a; font-size: 13px;">Gate Status: {gate_msg}</p>
                 </div>
