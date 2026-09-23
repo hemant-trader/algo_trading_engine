@@ -1,17 +1,17 @@
 import os
 import json
 import time
-from collections import Counter
+import datetime
 import requests
 import urllib.parse
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 from config import UPSTOX_CONFIG
 from core.types import MarketDirection, OptionType, NormalizedOptionTick
 from core.black_scholes import BlackScholesEngine
 from processing.tick_guard import TickGuardEngine
-from processing.oi_matrix import OptionChainOIEngine
 from processing.candidate_tracker import CandidateHysteresisTracker
 from engine.pulse_ttl import PulseTTLStateMachine
 from engine.safety_gate import ZeroTrustFinalSafetyGate
@@ -26,13 +26,11 @@ INDEX_CONFIG = {
     "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100, "sideways_range": 80.0},
 }
 
-# 1. State Persistence Setup
+# --- State Persistence Setup ---
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = "NIFTY 50"
 if "price_history" not in st.session_state:
     st.session_state["price_history"] = []
-if "direction_history" not in st.session_state:
-    st.session_state["direction_history"] = []
 if "tick_guard" not in st.session_state:
     st.session_state["tick_guard"] = TickGuardEngine()
 if "candidate_tracker" not in st.session_state:
@@ -95,18 +93,101 @@ if auth_code and "access_token" not in st.session_state:
         st.session_state["access_token"] = res["access_token"]
         save_token_to_file(res)
 
-# ================= SIDEBAR UI =================
+# ================= TECHNICAL ENGINE =================
+def calculate_rsi(price_history, period=14):
+    if len(price_history) < period + 1:
+        return 50.0
+    s = pd.Series(price_history)
+    delta = s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    last_loss = avg_loss.iloc[-1]
+    if last_loss == 0 or np.isnan(last_loss):
+        return 100.0 if avg_gain.iloc[-1] > 0 else 50.0
+    rs = avg_gain.iloc[-1] / last_loss
+    return float(100.0 - (100.0 / (1.0 + rs)))
+
+def evaluate_regime_and_direction(price_history, selected_index):
+    threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
+    if len(price_history) < 15:
+        return MarketDirection.NEUTRAL, 0.0, 50.0, 0.0, "INSUFFICIENT_DATA", threshold_range
+
+    s = pd.Series(price_history)
+    price_spread = float(s.max() - s.min())
+    ema5 = float(s.ewm(span=5, adjust=False).mean().iloc[-1])
+    ema15 = float(s.ewm(span=15, adjust=False).mean().iloc[-1])
+    current_price = float(s.iloc[-1])
+    price_lookback = float(s.iloc[-6]) if len(s) >= 6 else float(s.iloc[0])
+    
+    momentum_pct = ((current_price - price_lookback) / price_lookback) * 100.0
+    rsi = calculate_rsi(price_history, period=min(14, len(price_history)-1))
+
+    # Consolidation Guard: If price spread is tight and momentum is flat -> Strict NEUTRAL
+    if price_spread <= threshold_range and abs(momentum_pct) < 0.04:
+        return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
+
+    bull_score = 0
+    bear_score = 0
+
+    if ema5 > ema15:
+        bull_score += 2
+    elif ema5 < ema15:
+        bear_score += 2
+
+    if momentum_pct > 0.03:
+        bull_score += 2
+    elif momentum_pct < -0.03:
+        bear_score += 2
+
+    if current_price > ema5:
+        bull_score += 1
+    elif current_price < ema5:
+        bear_score += 1
+
+    if rsi >= 55.0:
+        bull_score += 2
+    elif rsi <= 45.0:
+        bear_score += 2
+
+    if bull_score >= 5 and bull_score >= (bear_score + 2):
+        trend_strength = (bull_score / 7.0) * 100.0
+        return MarketDirection.BULLISH, trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range
+    elif bear_score >= 5 and bear_score >= (bull_score + 2):
+        trend_strength = (bear_score / 7.0) * 100.0
+        return MarketDirection.BEARISH, trend_strength, rsi, price_spread, "TRENDING_BEARISH", threshold_range
+
+    return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
+
+def get_exact_tte(expiry_str):
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        exp_dt = datetime.datetime.strptime(expiry_str, "%Y-%m-%d").replace(
+            hour=10, minute=0, second=0, tzinfo=datetime.timezone.utc
+        )
+        diff_sec = max(0.0, (exp_dt - now).total_seconds())
+        return diff_sec / (365.0 * 86400.0)
+    except Exception:
+        return 0.015
+
+def get_nearest_expiry():
+    today = datetime.date.today()
+    days_ahead = (3 - today.weekday()) % 7
+    return (today + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+# ================= SIDEBAR CONTROLS =================
 st.sidebar.title("⚙️ System & Trade Control")
 st.sidebar.markdown("---")
 
-trade_mode = st.sidebar.radio(
+st.sidebar.radio(
     "Execution State",
-    ["🔴 OFF: Watch & Signal Mode\n(No Order Execution)", "🟢 ON: Live Auto-Trading Execution Mode"],
+    ["🔴 WATCH / SIGNAL ONLY (Paper Mode)"],
     index=0
 )
+st.sidebar.caption("🔒 *Auto-execution locked. Pure technical validation pipeline active.*")
 
 st.sidebar.markdown("---")
-
 index_keys = list(INDEX_CONFIG.keys())
 saved_idx_pos = index_keys.index(st.session_state["selected_index"]) if st.session_state["selected_index"] in index_keys else 0
 
@@ -120,7 +201,6 @@ selected_index = st.sidebar.selectbox(
 if selected_index != st.session_state["selected_index"]:
     st.session_state["selected_index"] = selected_index
     st.session_state["price_history"] = []
-    st.session_state["direction_history"] = []
     st.session_state["candidate_tracker"].flush()
     st.rerun()
 
@@ -159,18 +239,12 @@ else:
             os.remove(TOKEN_FILE)
         del st.session_state["access_token"]
         st.session_state["price_history"] = []
-        st.session_state["direction_history"] = []
         st.session_state["candidate_tracker"].flush()
         st.rerun()
 
-# ================= MAIN DASHBOARD UI =================
+# ================= MAIN RUNTIME =================
 st.title("⚡ Hemant Algo Trading Engine")
-
-is_live_execution = "🟢 ON" in trade_mode
-if is_live_execution:
-    st.error("🚨 **LIVE AUTO-EXECUTION IS ARMED:** Real orders will route based on Zero-Trust safety gates.")
-else:
-    st.info("ℹ️ **AUTO-EXECUTION IS OFF:** Engine is in Watch Mode. Displaying calculated signals only.")
+st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate is strictly enforced.")
 
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
@@ -184,149 +258,152 @@ if "access_token" in st.session_state:
 
     if spot_ltp is not None:
         st.session_state["price_history"].append(spot_ltp)
-        if len(st.session_state["price_history"]) > 30:
+        if len(st.session_state["price_history"]) > 50:
             st.session_state["price_history"].pop(0)
 
-        # 1. Raw Direction Extraction
-        if len(st.session_state["price_history"]) >= 2:
-            prev_price = st.session_state["price_history"][-2]
-            raw_dir = MarketDirection.BEARISH if spot_ltp < prev_price else MarketDirection.BULLISH
-        else:
-            raw_dir = MarketDirection.BEARISH
+        market_dir, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
+            st.session_state["price_history"], selected_index
+        )
 
-        st.session_state["direction_history"].append(raw_dir)
-        if len(st.session_state["direction_history"]) > 5:
-            st.session_state["direction_history"].pop(0)
-
-        # 2. 3-of-5 Direction Consensus
-        counts = Counter(st.session_state["direction_history"])
-        market_dir = counts.most_common(1)[0][0]
-        chosen_opt_type = OptionType.PE if market_dir == MarketDirection.BEARISH else OptionType.CE
-
-        # 3. Dynamic Market State & Best OTM Detection
-        threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
+        current_time = time.time()
+        active_expiry = get_nearest_expiry()
+        exact_tte = get_exact_tte(active_expiry)
 
-        if len(st.session_state["price_history"]) >= 5:
-            price_spread = max(st.session_state["price_history"]) - min(st.session_state["price_history"])
+        if market_dir == MarketDirection.BULLISH:
+            chosen_opt_type = OptionType.CE
+            selected_strike = atm_strike + strike_interval
+            regime_title = "TRENDING (BULLISH)"
+            regime_color = "#2ecc71"
+            trend_focus = "MOMENTUM CE"
+            best_otm_label = f"{int(selected_strike)} CE"
+            best_otm_color = "#64ffda"
+            banner_note = f"Breakout active ({price_spread:.1f} pts). Target strike selected for momentum."
+        elif market_dir == MarketDirection.BEARISH:
+            chosen_opt_type = OptionType.PE
+            selected_strike = atm_strike - strike_interval
+            regime_title = "TRENDING (BEARISH)"
+            regime_color = "#e74c3c"
+            trend_focus = "MOMENTUM PE"
+            best_otm_label = f"{int(selected_strike)} PE"
+            best_otm_color = "#64ffda"
+            banner_note = f"Breakdown active ({price_spread:.1f} pts). Target strike selected for momentum."
         else:
-            price_spread = 15.0
-
-        if price_spread <= threshold_range:
-            market_state_label = "SIDEWAYS / RANGEBOUND"
-            market_state_color = "#e67e22"
-            trend_focus_label = "NEUTRAL / NO CLEAR TREND"
+            chosen_opt_type = OptionType.CE
+            selected_strike = atm_strike
+            regime_title = "SIDEWAYS / RANGEBOUND"
+            regime_color = "#e67e22"
+            trend_focus = "NEUTRAL / NO CLEAR TREND"
             best_otm_label = "WAIT / AVOID OTM"
             best_otm_color = "#8892b0"
-            sub_alert_text = f"Narrow consolidation ({price_spread:.1f} pts range). High theta decay risk."
-        else:
-            market_state_label = f"TRENDING ({market_dir.name})"
-            market_state_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else "#e74c3c"
-            trend_focus_label = f"MOMENTUM {chosen_opt_type.value}"
-            
-            # Low Investment / High ROI Strike Calculation
-            if chosen_opt_type == OptionType.CE:
-                otm_target = atm_strike + strike_interval
+            banner_note = f"Narrow consolidation ({price_spread:.1f} pts vs {spread_thresh} threshold). High theta decay risk."
+
+        candidate = None
+        is_ready = False
+        passed = False
+        gate_msg = "NEUTRAL_REGIME_STANDBY"
+        final_action = "NO TRADE"
+        action_color = "#f1c40f"
+
+        if market_dir != MarketDirection.NEUTRAL:
+            symbol_prefix = selected_index.replace(" ", "").upper()
+            clean_symbol = f"{symbol_prefix}_{int(selected_strike)}_{chosen_opt_type.value}"
+
+            tick = NormalizedOptionTick(
+                symbol=clean_symbol,
+                instrument_key=clean_symbol,
+                underlying=selected_index,
+                underlying_spot=spot_ltp,
+                expiry=active_expiry,
+                strike=float(selected_strike),
+                option_type=chosen_opt_type,
+                ltp=0.0,
+                bid=0.0,
+                ask=0.0,
+                spread=0.0,
+                bid_qty=0,
+                ask_qty=0,
+                volume=0,
+                oi=0,
+                previous_oi=0,
+                volume_change=0,
+                oi_change=0,
+                price_change=0.0,
+                price_change_pct=0.0,
+                oi_change_pct=0.0,
+                iv=None,
+                timestamp=current_time,
+                sequence_no=int(current_time),
+                tte=exact_tte,
+                data_source="SPOT_TECHNICAL_STREAM"
+            )
+
+            greeks = BlackScholesEngine.calculate_greeks(
+                spot_ltp, tick.strike, tick.tte, 0.07, 0.14, tick.option_type
+            )
+
+            composite_score = float(trend_strength)
+
+            try:
+                candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                    tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
+                )
+            except TypeError:
+                candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                    tick.symbol, tick.strike, tick.option_type, composite_score
+                )
+
+            st.session_state["ttl_manager"].pulse(True)
+
+            if greeks is not None:
+                passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
+                    market_direction=market_dir,
+                    tick=tick,
+                    greeks=greeks,
+                    candidate=candidate,
+                    candidate_ready=is_ready,
+                    ttl_state=st.session_state["ttl_manager"],
+                    quality_grade="GRADE_A",
+                    max_spread_pct=0.02
+                )
             else:
-                otm_target = atm_strike - strike_interval
-            best_otm_label = f"{int(otm_target)} {chosen_opt_type.value} (Δ ~0.35)"
-            best_otm_color = "#64ffda"
-            sub_alert_text = f"Breakout active ({price_spread:.1f} pts range). Optimal OTM strike ready for high ROI move."
+                passed = False
+                gate_msg = "BLOCKED: Greeks calculation failed"
 
-        current_time = time.time()
-        sample_opt_price = 145.0
-        
-        symbol_prefix = selected_index.replace(" ", "").upper()
-        clean_symbol = f"{symbol_prefix}_{int(atm_strike)}_{chosen_opt_type.value}"
-
-        tick = NormalizedOptionTick(
-            symbol=clean_symbol,
-            underlying=selected_index,
-            expiry="2026-09-17",
-            strike=float(atm_strike),
-            option_type=chosen_opt_type,
-            ltp=sample_opt_price,
-            bid=sample_opt_price - 0.20,
-            ask=sample_opt_price + 0.20,
-            spread=0.40,
-            volume=45000,
-            oi=110000,
-            volume_change=3000,
-            oi_change=12000,
-            price_change=8.5 if chosen_opt_type == OptionType.CE else -8.5,
-            price_change_pct=6.2,
-            oi_change_pct=11.5,
-            timestamp=current_time,
-            sequence_no=int(current_time),
-            tte=0.015
-        )
-
-        is_valid_tick, _ = st.session_state["tick_guard"].validate_tick(tick, current_time)
-        st.session_state["ttl_manager"].pulse(is_valid_tick)
-
-        iv = BlackScholesEngine.implied_volatility(
-            tick.ltp, spot_ltp, tick.strike, tick.tte, 0.07, tick.option_type
-        )
-        greeks = BlackScholesEngine.calculate_greeks(
-            spot_ltp, tick.strike, tick.tte, 0.07, iv, tick.option_type
-        )
-        oi_score = OptionChainOIEngine.calculate_oi_score(tick, market_dir)
-        composite_score = 75.0 + oi_score
-
-        try:
-            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
-            )
-        except TypeError:
-            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                tick.symbol, tick.strike, tick.option_type, composite_score
-            )
-
-        passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
-            market_direction=market_dir,
-            tick=tick,
-            greeks=greeks,
-            candidate=candidate,
-            candidate_ready=is_ready,
-            ttl_state=st.session_state["ttl_manager"],
-            quality_grade="GRADE_A",
-            max_spread_pct=0.02
-        )
-
-        confidence_pct = min(max(composite_score, 10.0), 98.0)
-        conf_color = "#2ecc71" if confidence_pct >= 80.0 else ("#f1c40f" if confidence_pct >= 70.0 else "#e74c3c")
-
-        if passed and candidate is not None:
-            final_action = f"BUY {candidate.option_type.value}"
-            action_color = "#ff4b4b" if candidate.option_type == OptionType.PE else "#2ecc71"
+            # Strict Safety Gate Enforcement: Gate must pass + candidate confirmed + score >= 75
+            if passed and is_ready and composite_score >= 75.0 and market_dir != MarketDirection.NEUTRAL:
+                final_action = f"BUY {chosen_opt_type.value}"
+                action_color = "#2ecc71" if chosen_opt_type == OptionType.CE else "#ff4b4b"
+            else:
+                final_action = "NO TRADE"
+                action_color = "#f1c40f"
         else:
-            final_action = "NO TRADE"
-            action_color = "#f1c40f"
+            st.session_state["candidate_tracker"].flush()
 
+        # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
 
         with col_metric:
-            # INTEGRATED REGIME BANNER WITH OPTIMAL OTM STRIKE
             regime_html = (
                 f'<div style="background-color:#161f30; padding:12px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">'
                 f'<div style="display:flex; justify-content:space-between; align-items:center;">'
                 f'<div><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">MARKET STATE ({selected_index})</span>'
-                f'<div style="color:{market_state_color}; font-size:14px; font-weight:bold; margin-top:2px;">⏳ {market_state_label}</div></div>'
+                f'<div style="color:{regime_color}; font-size:14px; font-weight:bold; margin-top:2px;">⏳ {regime_title}</div></div>'
                 f'<div style="text-align:center;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">TREND FOCUS</span>'
-                f'<div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus_label}</div></div>'
-                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 OPTIMAL OTM (HIGH ROI)</span>'
+                f'<div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus}</div></div>'
+                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 TARGET STRIKE</span>'
                 f'<div style="color:{best_otm_color}; font-size:13px; font-weight:bold; margin-top:2px;">{best_otm_label}</div></div>'
                 f'</div>'
-                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ {sub_alert_text}</div>'
+                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ {banner_note}</div>'
                 f'</div>'
             )
             st.markdown(regime_html, unsafe_allow_html=True)
 
             m1, m2, m3 = st.columns(3)
             m1.metric(label=f"{selected_index} Spot", value=f"₹{spot_ltp:,.2f}")
-            m2.metric(label="Calculated Delta", value=f"{greeks.delta:.3f}")
-            m3.metric(label="Implied Volatility", value=f"{iv * 100:.2f}%")
+            m2.metric(label="Calculated RSI (14)", value=f"{rsi_val:.1f}")
+            m3.metric(label="Range Spread (Pts)", value=f"{price_spread:.1f}")
 
             st.markdown("---")
             st.subheader(f"📈 Real Tick Feed: {selected_index}")
@@ -338,19 +415,32 @@ if "access_token" in st.session_state:
                 f"{candidate.confirmation_count}/3 Confirmed" 
                 if candidate else "0/3 Confirmed"
             )
+            score_display = f"{trend_strength:.1f}%" if market_dir != MarketDirection.NEUTRAL else "0.0%"
+            score_color = "#2ecc71" if trend_strength >= 75.0 else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
+            gate_badge = "PASSED" if passed else "BLOCKED"
+            gate_badge_color = "#2ecc71" if passed else "#e74c3c"
+
             st.markdown(
                 f"""
-                <div style="background-color:#1e222d; padding:22px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
+                <div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
                     <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
-                    <h1 style="color:{action_color}; font-size: 34px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
-                    <div style="background-color:#14171f; padding:8px 12px; border-radius:8px; margin-bottom:10px; display:inline-block; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:13px;">Signal Confidence: </span>
-                        <b style="color:{conf_color}; font-size:16px;">{confidence_pct:.1f}%</b>
+                    <h1 style="color:{action_color}; font-size: 32px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
+                    
+                    <div style="display:flex; justify-content:space-around; margin-bottom:10px;">
+                        <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; border:1px solid #2a2e39;">
+                            <span style="color:#848d9c; font-size:11px;">Trend Score</span><br>
+                            <b style="color:{score_color}; font-size:14px;">{score_display}</b>
+                        </div>
+                        <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; border:1px solid #2a2e39;">
+                            <span style="color:#848d9c; font-size:11px;">Safety Gate</span><br>
+                            <b style="color:{gate_badge_color}; font-size:14px;">{gate_badge}</b>
+                        </div>
                     </div>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Consensus Direction: <b>{market_dir.name}</b></p>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
-                    <p style="color:#3498db; font-size: 13px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
-                    <p style="color:#57606a; font-size: 12px; margin-top: 4px;">Gate Status: {gate_msg}</p>
+
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Consensus: <b>{market_dir.name}</b></p>
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Active Contract: <b>{candidate.symbol if candidate else 'Standby'}</b></p>
+                    <p style="color:#3498db; font-size: 12px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
+                    <p style="color:#57606a; font-size: 11px; margin-top: 4px;">Gate Info: {gate_msg}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
