@@ -21,9 +21,9 @@ st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 TOKEN_FILE = "access_token.json"
 
 INDEX_CONFIG = {
-    "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50, "trend_threshold": 25.0},
-    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "strike_mult": 100, "trend_threshold": 70.0},
-    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100, "trend_threshold": 80.0},
+    "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50},
+    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "strike_mult": 100},
+    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100},
 }
 
 # 1. State Persistence Setup
@@ -198,7 +198,7 @@ if "access_token" in st.session_state:
         if len(st.session_state["direction_history"]) > 5:
             st.session_state["direction_history"].pop(0)
 
-        # 2. 3-of-5 Direction Consensus Gate
+        # 2. 3-of-5 Direction Consensus Gate (Noise Filter)
         counts = Counter(st.session_state["direction_history"])
         market_dir = counts.most_common(1)[0][0]
         chosen_opt_type = OptionType.PE if market_dir == MarketDirection.BEARISH else OptionType.CE
@@ -206,11 +206,19 @@ if "access_token" in st.session_state:
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
 
-        current_time = time.time()
-        sample_opt_price = 145.0
-        
+        # ---------------- BEST OTM (SWEET SPOT) CALCULATION ----------------
+        # CE ke liye 1 step OTM = ATM + step, PE ke liye 1 step OTM = ATM - step
+        if chosen_opt_type == OptionType.CE:
+            otm_strike = atm_strike + strike_interval
+        else:
+            otm_strike = atm_strike - strike_interval
+
         symbol_prefix = selected_index.replace(" ", "").upper()
         clean_symbol = f"{symbol_prefix}_{int(atm_strike)}_{chosen_opt_type.value}"
+        otm_clean_symbol = f"{symbol_prefix}_{int(otm_strike)}_{chosen_opt_type.value}"
+
+        current_time = time.time()
+        sample_opt_price = 145.0
 
         tick = NormalizedOptionTick(
             symbol=clean_symbol,
@@ -246,7 +254,6 @@ if "access_token" in st.session_state:
         oi_score = OptionChainOIEngine.calculate_oi_score(tick, market_dir)
         composite_score = 75.0 + oi_score
 
-        # Candidate processing
         try:
             candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
                 tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
@@ -270,69 +277,12 @@ if "access_token" in st.session_state:
         confidence_pct = min(max(composite_score, 10.0), 98.0)
         conf_color = "#2ecc71" if confidence_pct >= 80.0 else ("#f1c40f" if confidence_pct >= 70.0 else "#e74c3c")
 
-        # Action Colors: BUY PE -> Red (#ff4b4b), BUY CE -> Green (#2ecc71), NO TRADE -> Yellow (#f1c40f)
         if passed and candidate is not None:
             final_action = f"BUY {candidate.option_type.value}"
             action_color = "#ff4b4b" if candidate.option_type == OptionType.PE else "#2ecc71"
         else:
             final_action = "NO TRADE"
             action_color = "#f1c40f"
-
-        # ---------------- MARKET REGIME & CALL / PUT TREND LOGIC ----------------
-        hist = st.session_state["price_history"]
-        threshold = INDEX_CONFIG[selected_index]["trend_threshold"]
-        
-        if len(hist) >= 5:
-            price_spread = max(hist) - min(hist)
-            is_trending = price_spread >= threshold
-        else:
-            price_spread = 0.0
-            is_trending = False
-
-        if is_trending:
-            if market_dir == MarketDirection.BULLISH:
-                trend_bias_text = "CALL (CE) FAVORABLE"
-                trend_bias_color = "#2ecc71"
-                suitability_sub = f"Bullish breakout active ({price_spread:.1f} pts range). Favorable for CE buyers."
-            else:
-                trend_bias_text = "PUT (PE) FAVORABLE"
-                trend_bias_color = "#ff4b4b"
-                suitability_sub = f"Bearish selling active ({price_spread:.1f} pts range). Favorable for PE buyers."
-            
-            regime_label = "🌊 TRENDING / MOMENTUM"
-            regime_color = "#2ecc71"
-            suitability_label = "🟢 SUITABLE FOR BUYING"
-        else:
-            regime_label = "⏳ SIDEWAYS / RANGEBOUND"
-            regime_color = "#f39c12"
-            trend_bias_text = "NEUTRAL / NO CLEAR TREND"
-            trend_bias_color = "#8b949e"
-            suitability_label = "🛑 AVOID BUYING (THETA RISK)"
-            suitability_sub = f"Narrow consolidation ({price_spread:.1f} pts range). High theta decay risk."
-
-        # Market Suitability & Trend Focus Banner
-        st.markdown(
-            f"""
-            <div style="background-color:#161922; padding:14px 18px; border-radius:10px; margin-bottom:15px; border-left: 5px solid {regime_color}; border-top:1px solid #282d3b; border-right:1px solid #282d3b; border-bottom:1px solid #282d3b;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
-                    <div>
-                        <span style="color:#8b949e; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Market State ({selected_index})</span>
-                        <div style="color:{regime_color}; font-size:15px; font-weight:bold; margin-top:2px;">{regime_label}</div>
-                    </div>
-                    <div style="text-align:center;">
-                        <span style="color:#8b949e; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Trend Focus</span>
-                        <div style="color:{trend_bias_color}; font-size:16px; font-weight:bold; margin-top:2px;">{trend_bias_text}</div>
-                    </div>
-                    <div style="text-align:right;">
-                        <span style="color:#8b949e; font-size:12px; text-transform:uppercase; letter-spacing:0.5px;">Buyer Action</span>
-                        <div style="color:{regime_color}; font-size:15px; font-weight:bold; margin-top:2px;">{suitability_label}</div>
-                    </div>
-                </div>
-                <div style="color:#6e7681; font-size:12px; margin-top:8px;">ℹ️ {suitability_sub}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
 
         col_metric, col_signal_card = st.columns([2, 1])
 
@@ -354,17 +304,32 @@ if "access_token" in st.session_state:
             )
             st.markdown(
                 f"""
-                <div style="background-color:#1e222d; padding:22px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
+                <div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
                     <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
-                    <h1 style="color:{action_color}; font-size: 34px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
-                    <div style="background-color:#14171f; padding:8px 12px; border-radius:8px; margin-bottom:10px; display:inline-block; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:13px;">Signal Confidence: </span>
-                        <b style="color:{conf_color}; font-size:16px;">{confidence_pct:.1f}%</b>
+                    <h1 style="color:{action_color}; font-size: 32px; margin-top:2px; margin-bottom:6px; font-weight: bold;">{final_action}</h1>
+                    <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; margin-bottom:8px; display:inline-block; border:1px solid #2a2e39;">
+                        <span style="color:#848d9c; font-size:12px;">Signal Confidence: </span>
+                        <b style="color:{conf_color}; font-size:15px;">{confidence_pct:.1f}%</b>
                     </div>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Consensus Direction: <b>{market_dir.name}</b></p>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
-                    <p style="color:#3498db; font-size: 13px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
-                    <p style="color:#57606a; font-size: 12px; margin-top: 4px;">Gate Status: {gate_msg}</p>
+                    
+                    <!-- BEST OTM RECOMMENDATION SECTION -->
+                    <div style="background-color: #161c28; border: 1px dashed #3498db; border-radius: 8px; padding: 10px; margin: 10px 0; text-align: left;">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="color: #64b5f6; font-size: 11px; font-weight: bold; text-transform: uppercase;">🎯 Best Low-Cost OTM</span>
+                            <span style="background-color: #0d47a1; color: #bbdefb; font-size: 10px; padding: 2px 6px; border-radius: 4px;">High ROI</span>
+                        </div>
+                        <div style="font-size: 15px; font-weight: bold; color: #ffffff; margin-top: 4px;">
+                            {otm_clean_symbol}
+                        </div>
+                        <div style="color: #90caf9; font-size: 11px; margin-top: 2px;">
+                            Low Risk • Delta: ~0.35 • Fast Move Multiplier
+                        </div>
+                    </div>
+
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Consensus Direction: <b>{market_dir.name}</b></p>
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Candidate (ATM): <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
+                    <p style="color:#3498db; font-size: 12px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
+                    <p style="color:#57606a; font-size: 11px; margin-top: 4px;">Gate Status: {gate_msg}</p>
                 </div>
                 """,
                 unsafe_allow_html=True
