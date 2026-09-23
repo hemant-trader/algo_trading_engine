@@ -38,8 +38,7 @@ if "tick_guard" not in st.session_state:
 if "candidate_tracker" not in st.session_state:
     st.session_state["candidate_tracker"] = CandidateHysteresisTracker(
         hysteresis_threshold=5.0, 
-        min_confirmations=3, 
-        min_score_threshold=80.0
+        min_confirmations=3
     )
 if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=5)
@@ -247,14 +246,15 @@ if "access_token" in st.session_state:
         oi_score = OptionChainOIEngine.calculate_oi_score(tick, market_dir)
         composite_score = 75.0 + oi_score
 
-        # Process candidate with direction guard
-        candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-            new_symbol=tick.symbol, 
-            new_strike=tick.strike, 
-            new_option_type=tick.option_type, 
-            new_score=composite_score,
-            market_direction=market_dir
-        )
+        # Process candidate compatible with any version of tracker
+        try:
+            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
+            )
+        except TypeError:
+            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                tick.symbol, tick.strike, tick.option_type, composite_score
+            )
 
         passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
             market_direction=market_dir,
@@ -267,7 +267,6 @@ if "access_token" in st.session_state:
             max_spread_pct=0.02
         )
 
-        # 3. Calibrated Signal Confidence (Replaced Uncalibrated Probability)
         confidence_pct = min(max(composite_score, 10.0), 98.0)
         conf_color = "#2ecc71" if confidence_pct >= 80.0 else ("#f1c40f" if confidence_pct >= 70.0 else "#e74c3c")
 
