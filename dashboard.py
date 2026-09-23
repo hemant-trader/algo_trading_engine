@@ -179,12 +179,15 @@ def get_nearest_expiry():
 st.sidebar.title("⚙️ System & Trade Control")
 st.sidebar.markdown("---")
 
-st.sidebar.radio(
+# Restored Live / Watch Mode Toggle
+trade_mode = st.sidebar.radio(
     "Execution State",
-    ["🔴 WATCH / SIGNAL ONLY (Paper Mode)"],
+    [
+        "🔴 OFF: Watch & Signal Mode (Paper Mode)",
+        "🟢 ON: Live Auto-Trading Execution Mode"
+    ],
     index=0
 )
-st.sidebar.caption("🔒 *Auto-execution locked. Pure technical validation pipeline active.*")
 
 st.sidebar.markdown("---")
 index_keys = list(INDEX_CONFIG.keys())
@@ -243,7 +246,12 @@ else:
 
 # ================= MAIN RUNTIME =================
 st.title("⚡ Hemant Algo Trading Engine")
-st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate is strictly enforced.")
+
+is_live_execution = "🟢 ON" in trade_mode
+if is_live_execution:
+    st.error("🚨 **LIVE AUTO-EXECUTION ARMED:** Orders will route to broker when Zero-Trust Gate passes.")
+else:
+    st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate is strictly enforced (No real orders placed).")
 
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
@@ -370,9 +378,11 @@ if "access_token" in st.session_state:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
 
+            # Strict Safety Gate Enforcement
             if passed and is_ready and composite_score >= 75.0 and market_dir != MarketDirection.NEUTRAL:
                 final_action = f"BUY {chosen_opt_type.value}"
-                action_color = "#2ecc71" if chosen_opt_type == OptionType.CE else "#ff4b4b"
+                # Red font for BUY PE, Green font for BUY CE
+                action_color = "#ff4b4b" if chosen_opt_type == OptionType.PE else "#2ecc71"
             else:
                 final_action = "NO TRADE"
                 action_color = "#f1c40f"
