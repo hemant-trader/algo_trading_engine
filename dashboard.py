@@ -203,8 +203,11 @@ if "access_token" in st.session_state:
         market_dir = counts.most_common(1)[0][0]
         chosen_opt_type = OptionType.PE if market_dir == MarketDirection.BEARISH else OptionType.CE
 
-        # 3. Dynamic Market State / Regime Detection
+        # 3. Dynamic Market State & Best OTM Detection
         threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
+        strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
+        atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
+
         if len(st.session_state["price_history"]) >= 5:
             price_spread = max(st.session_state["price_history"]) - min(st.session_state["price_history"])
         else:
@@ -214,15 +217,22 @@ if "access_token" in st.session_state:
             market_state_label = "SIDEWAYS / RANGEBOUND"
             market_state_color = "#e67e22"
             trend_focus_label = "NEUTRAL / NO CLEAR TREND"
+            best_otm_label = "WAIT / AVOID OTM"
+            best_otm_color = "#8892b0"
             sub_alert_text = f"Narrow consolidation ({price_spread:.1f} pts range). High theta decay risk."
         else:
             market_state_label = f"TRENDING ({market_dir.name})"
             market_state_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else "#e74c3c"
             trend_focus_label = f"MOMENTUM {chosen_opt_type.value}"
-            sub_alert_text = f"Range expanded ({price_spread:.1f} pts range). Directional momentum active."
-
-        strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
-        atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
+            
+            # Low Investment / High ROI Strike Calculation
+            if chosen_opt_type == OptionType.CE:
+                otm_target = atm_strike + strike_interval
+            else:
+                otm_target = atm_strike - strike_interval
+            best_otm_label = f"{int(otm_target)} {chosen_opt_type.value} (Δ ~0.35)"
+            best_otm_color = "#64ffda"
+            sub_alert_text = f"Breakout active ({price_spread:.1f} pts range). Optimal OTM strike ready for high ROI move."
 
         current_time = time.time()
         sample_opt_price = 145.0
@@ -297,14 +307,16 @@ if "access_token" in st.session_state:
         col_metric, col_signal_card = st.columns([2, 1])
 
         with col_metric:
-            # DARK BLUE MARKET STATE REGIME BANNER
+            # INTEGRATED REGIME BANNER WITH OPTIMAL OTM STRIKE
             regime_html = (
                 f'<div style="background-color:#161f30; padding:12px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">'
                 f'<div style="display:flex; justify-content:space-between; align-items:center;">'
                 f'<div><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">MARKET STATE ({selected_index})</span>'
                 f'<div style="color:{market_state_color}; font-size:14px; font-weight:bold; margin-top:2px;">⏳ {market_state_label}</div></div>'
-                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">TREND FOCUS</span>'
+                f'<div style="text-align:center;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">TREND FOCUS</span>'
                 f'<div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus_label}</div></div>'
+                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 OPTIMAL OTM (HIGH ROI)</span>'
+                f'<div style="color:{best_otm_color}; font-size:13px; font-weight:bold; margin-top:2px;">{best_otm_label}</div></div>'
                 f'</div>'
                 f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ {sub_alert_text}</div>'
                 f'</div>'
