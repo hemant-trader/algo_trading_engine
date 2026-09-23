@@ -16,6 +16,17 @@ class TradeAction(Enum):
     NO_TRADE = "NO_TRADE"
     EXIT = "EXIT"
 
+@dataclass
+class CandidateState:
+    symbol: str
+    strike: float
+    option_type: OptionType
+    composite_score: float
+    confirmation_count: int
+    first_seen_time: float
+    last_seen_time: float
+    direction: MarketDirection
+
 @dataclass(frozen=True)
 class NormalizedOptionTick:
     symbol: str
