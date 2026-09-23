@@ -21,9 +21,9 @@ st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 TOKEN_FILE = "access_token.json"
 
 INDEX_CONFIG = {
-    "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50},
-    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "strike_mult": 100},
-    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100},
+    "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50, "sideways_range": 25.0},
+    "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "strike_mult": 100, "sideways_range": 60.0},
+    "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100, "sideways_range": 80.0},
 }
 
 # 1. State Persistence Setup
@@ -187,7 +187,7 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 30:
             st.session_state["price_history"].pop(0)
 
-        # 1. Raw Tick Direction Extraction
+        # 1. Raw Direction Extraction
         if len(st.session_state["price_history"]) >= 2:
             prev_price = st.session_state["price_history"][-2]
             raw_dir = MarketDirection.BEARISH if spot_ltp < prev_price else MarketDirection.BULLISH
@@ -198,10 +198,28 @@ if "access_token" in st.session_state:
         if len(st.session_state["direction_history"]) > 5:
             st.session_state["direction_history"].pop(0)
 
-        # 2. 3-of-5 Direction Consensus Gate (Noise Filter)
+        # 2. 3-of-5 Direction Consensus
         counts = Counter(st.session_state["direction_history"])
         market_dir = counts.most_common(1)[0][0]
         chosen_opt_type = OptionType.PE if market_dir == MarketDirection.BEARISH else OptionType.CE
+
+        # 3. Dynamic Market State / Regime Detection
+        threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
+        if len(st.session_state["price_history"]) >= 5:
+            price_spread = max(st.session_state["price_history"]) - min(st.session_state["price_history"])
+        else:
+            price_spread = 15.0
+
+        if price_spread <= threshold_range:
+            market_state_label = "SIDEWAYS / RANGEBOUND"
+            market_state_color = "#e67e22"
+            trend_focus_label = "NEUTRAL / NO CLEAR TREND"
+            sub_alert_text = f"Narrow consolidation ({price_spread:.1f} pts range). High theta decay risk."
+        else:
+            market_state_label = f"TRENDING ({market_dir.name})"
+            market_state_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else "#e74c3c"
+            trend_focus_label = f"MOMENTUM {chosen_opt_type.value}"
+            sub_alert_text = f"Range expanded ({price_spread:.1f} pts range). Directional momentum active."
 
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
@@ -246,7 +264,6 @@ if "access_token" in st.session_state:
         oi_score = OptionChainOIEngine.calculate_oi_score(tick, market_dir)
         composite_score = 75.0 + oi_score
 
-        # Process candidate compatible with any version of tracker
         try:
             candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
                 tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
@@ -280,6 +297,20 @@ if "access_token" in st.session_state:
         col_metric, col_signal_card = st.columns([2, 1])
 
         with col_metric:
+            # DARK BLUE MARKET STATE REGIME BANNER
+            regime_html = (
+                f'<div style="background-color:#161f30; padding:12px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                f'<div><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">MARKET STATE ({selected_index})</span>'
+                f'<div style="color:{market_state_color}; font-size:14px; font-weight:bold; margin-top:2px;">⏳ {market_state_label}</div></div>'
+                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">TREND FOCUS</span>'
+                f'<div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus_label}</div></div>'
+                f'</div>'
+                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ {sub_alert_text}</div>'
+                f'</div>'
+            )
+            st.markdown(regime_html, unsafe_allow_html=True)
+
             m1, m2, m3 = st.columns(3)
             m1.metric(label=f"{selected_index} Spot", value=f"₹{spot_ltp:,.2f}")
             m2.metric(label="Calculated Delta", value=f"{greeks.delta:.3f}")
