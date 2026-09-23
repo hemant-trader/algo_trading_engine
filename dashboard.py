@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from collections import Counter
 import requests
 import urllib.parse
 import pandas as pd
@@ -25,15 +26,21 @@ INDEX_CONFIG = {
     "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100},
 }
 
-# 1. State Persistence Fix (Index Selection & History)
+# 1. State Persistence Setup
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = "NIFTY 50"
 if "price_history" not in st.session_state:
     st.session_state["price_history"] = []
+if "direction_history" not in st.session_state:
+    st.session_state["direction_history"] = []
 if "tick_guard" not in st.session_state:
     st.session_state["tick_guard"] = TickGuardEngine()
 if "candidate_tracker" not in st.session_state:
-    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_threshold=5.0, min_confirmations=3)
+    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(
+        hysteresis_threshold=5.0, 
+        min_confirmations=3, 
+        min_score_threshold=80.0
+    )
 if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=5)
 
@@ -114,7 +121,8 @@ selected_index = st.sidebar.selectbox(
 if selected_index != st.session_state["selected_index"]:
     st.session_state["selected_index"] = selected_index
     st.session_state["price_history"] = []
-    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_threshold=5.0, min_confirmations=3)
+    st.session_state["direction_history"] = []
+    st.session_state["candidate_tracker"].flush()
     st.rerun()
 
 step_val = INDEX_CONFIG[selected_index]["step"]
@@ -152,7 +160,8 @@ else:
             os.remove(TOKEN_FILE)
         del st.session_state["access_token"]
         st.session_state["price_history"] = []
-        st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_threshold=5.0, min_confirmations=3)
+        st.session_state["direction_history"] = []
+        st.session_state["candidate_tracker"].flush()
         st.rerun()
 
 # ================= MAIN DASHBOARD UI =================
@@ -179,28 +188,21 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 30:
             st.session_state["price_history"].pop(0)
 
-        # Robust Trend & Option Type Calculation
-        if len(st.session_state["price_history"]) >= 4:
-            past_prices = st.session_state["price_history"][:-1]
-            past_avg = sum(past_prices) / len(past_prices)
-            recent_delta = spot_ltp - past_prices[-1]
-            
-            if spot_ltp <= past_avg or recent_delta <= 0:
-                market_dir = MarketDirection.BEARISH
-                chosen_opt_type = OptionType.PE
-            else:
-                market_dir = MarketDirection.BULLISH
-                chosen_opt_type = OptionType.CE
-        elif len(st.session_state["price_history"]) >= 2:
-            if spot_ltp <= st.session_state["price_history"][-2]:
-                market_dir = MarketDirection.BEARISH
-                chosen_opt_type = OptionType.PE
-            else:
-                market_dir = MarketDirection.BULLISH
-                chosen_opt_type = OptionType.CE
+        # 1. Raw Tick Direction Extraction
+        if len(st.session_state["price_history"]) >= 2:
+            prev_price = st.session_state["price_history"][-2]
+            raw_dir = MarketDirection.BEARISH if spot_ltp < prev_price else MarketDirection.BULLISH
         else:
-            market_dir = MarketDirection.BEARISH
-            chosen_opt_type = OptionType.PE
+            raw_dir = MarketDirection.BEARISH
+
+        st.session_state["direction_history"].append(raw_dir)
+        if len(st.session_state["direction_history"]) > 5:
+            st.session_state["direction_history"].pop(0)
+
+        # 2. 3-of-5 Direction Consensus Gate (Noise Filter)
+        counts = Counter(st.session_state["direction_history"])
+        market_dir = counts.most_common(1)[0][0]
+        chosen_opt_type = OptionType.PE if market_dir == MarketDirection.BEARISH else OptionType.CE
 
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
@@ -243,10 +245,15 @@ if "access_token" in st.session_state:
             spot_ltp, tick.strike, tick.tte, 0.07, iv, tick.option_type
         )
         oi_score = OptionChainOIEngine.calculate_oi_score(tick, market_dir)
-        composite_score = 80.0 + oi_score
+        composite_score = 75.0 + oi_score
 
+        # Process candidate with direction guard
         candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-            tick.symbol, tick.strike, tick.option_type, composite_score
+            new_symbol=tick.symbol, 
+            new_strike=tick.strike, 
+            new_option_type=tick.option_type, 
+            new_score=composite_score,
+            market_direction=market_dir
         )
 
         passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
@@ -260,20 +267,11 @@ if "access_token" in st.session_state:
             max_spread_pct=0.02
         )
 
-        # ---------------- CHANCE OF WINNING (POP) CALCULATION ----------------
-        base_pop = abs(greeks.delta) * 100.0
-        oi_adjustment = (oi_score / 20.0) * 5.0
-        win_chance = min(max(base_pop + oi_adjustment, 15.0), 88.0)
-        
-        if win_chance >= 50.0:
-            win_color = "#2ecc71"
-        elif win_chance >= 40.0:
-            win_color = "#f1c40f"
-        else:
-            win_color = "#e74c3c"
+        # 3. Calibrated Signal Confidence (Replaced Uncalibrated Probability)
+        confidence_pct = min(max(composite_score, 10.0), 98.0)
+        conf_color = "#2ecc71" if confidence_pct >= 80.0 else ("#f1c40f" if confidence_pct >= 70.0 else "#e74c3c")
 
-        # Action Colors: BUY PE -> Red, BUY CE -> Green, NO TRADE -> Yellow
-        if passed:
+        if passed and candidate is not None:
             final_action = f"BUY {candidate.option_type.value}"
             action_color = "#ff4b4b" if candidate.option_type == OptionType.PE else "#2ecc71"
         else:
@@ -294,17 +292,22 @@ if "access_token" in st.session_state:
             st.line_chart(df_chart)
 
         with col_signal_card:
+            confirmations_status = (
+                f"{candidate.confirmation_count}/3 Confirmed" 
+                if candidate else "0/3 Confirmed"
+            )
             st.markdown(
                 f"""
                 <div style="background-color:#1e222d; padding:22px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
                     <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
                     <h1 style="color:{action_color}; font-size: 34px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
                     <div style="background-color:#14171f; padding:8px 12px; border-radius:8px; margin-bottom:10px; display:inline-block; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:13px;">Chance of Winning: </span>
-                        <b style="color:{win_color}; font-size:16px;">{win_chance:.1f}%</b>
+                        <span style="color:#848d9c; font-size:13px;">Signal Confidence: </span>
+                        <b style="color:{conf_color}; font-size:16px;">{confidence_pct:.1f}%</b>
                     </div>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Direction: <b>{market_dir.name}</b></p>
+                    <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Consensus Direction: <b>{market_dir.name}</b></p>
                     <p style="color:#848d9c; margin-bottom: 2px; font-size:14px;">Candidate: <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
+                    <p style="color:#3498db; font-size: 13px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
                     <p style="color:#57606a; font-size: 12px; margin-top: 4px;">Gate Status: {gate_msg}</p>
                 </div>
                 """,
@@ -314,7 +317,6 @@ if "access_token" in st.session_state:
     else:
         st.warning(f"Connecting to Upstox market feed for {selected_index}...")
 
-    # 2. Seamless 5-Second Native Auto-Refresh Loop
     time.sleep(5)
     st.rerun()
 
