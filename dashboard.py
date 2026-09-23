@@ -124,7 +124,6 @@ def evaluate_regime_and_direction(price_history, selected_index):
     momentum_pct = ((current_price - price_lookback) / price_lookback) * 100.0
     rsi = calculate_rsi(price_history, period=min(14, len(price_history)-1))
 
-    # Consolidation Guard: If price spread is tight and momentum is flat -> Strict NEUTRAL
     if price_spread <= threshold_range and abs(momentum_pct) < 0.04:
         return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
 
@@ -371,7 +370,6 @@ if "access_token" in st.session_state:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
 
-            # Strict Safety Gate Enforcement: Gate must pass + candidate confirmed + score >= 75
             if passed and is_ready and composite_score >= 75.0 and market_dir != MarketDirection.NEUTRAL:
                 final_action = f"BUY {chosen_opt_type.value}"
                 action_color = "#2ecc71" if chosen_opt_type == OptionType.CE else "#ff4b4b"
@@ -419,32 +417,29 @@ if "access_token" in st.session_state:
             score_color = "#2ecc71" if trend_strength >= 75.0 else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
             gate_badge = "PASSED" if passed else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed else "#e74c3c"
+            cand_sym = candidate.symbol if candidate else "Standby"
 
-            st.markdown(
-                f"""
-                <div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
-                    <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
-                    <h1 style="color:{action_color}; font-size: 32px; margin-top:2px; margin-bottom:8px; font-weight: bold;">{final_action}</h1>
-                    
-                    <div style="display:flex; justify-content:space-around; margin-bottom:10px;">
-                        <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; border:1px solid #2a2e39;">
-                            <span style="color:#848d9c; font-size:11px;">Trend Score</span><br>
-                            <b style="color:{score_color}; font-size:14px;">{score_display}</b>
-                        </div>
-                        <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; border:1px solid #2a2e39;">
-                            <span style="color:#848d9c; font-size:11px;">Safety Gate</span><br>
-                            <b style="color:{gate_badge_color}; font-size:14px;">{gate_badge}</b>
-                        </div>
-                    </div>
-
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Consensus: <b>{market_dir.name}</b></p>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Active Contract: <b>{candidate.symbol if candidate else 'Standby'}</b></p>
-                    <p style="color:#3498db; font-size: 12px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
-                    <p style="color:#57606a; font-size: 11px; margin-top: 4px;">Gate Info: {gate_msg}</p>
-                </div>
-                """,
-                unsafe_allow_html=True
+            card_html = (
+                f'<div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border:1px solid #363c4e;">'
+                f'<h3 style="color:#b2b9c7; margin-bottom:2px; font-size:18px;">⚡ Engine Signal</h3>'
+                f'<h1 style="color:{action_color}; font-size:32px; margin-top:2px; margin-bottom:12px; font-weight:bold;">{final_action}</h1>'
+                f'<div style="display:flex; justify-content:space-around; margin-bottom:12px;">'
+                f'<div style="background-color:#14171f; padding:6px 12px; border-radius:6px; border:1px solid #2a2e39;">'
+                f'<span style="color:#848d9c; font-size:11px;">Trend Score</span><br>'
+                f'<b style="color:{score_color}; font-size:14px;">{score_display}</b>'
+                f'</div>'
+                f'<div style="background-color:#14171f; padding:6px 12px; border-radius:6px; border:1px solid #2a2e39;">'
+                f'<span style="color:#848d9c; font-size:11px;">Safety Gate</span><br>'
+                f'<b style="color:{gate_badge_color}; font-size:14px;">{gate_badge}</b>'
+                f'</div>'
+                f'</div>'
+                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Consensus: <b style="color:#ffffff;">{market_dir.name}</b></p>'
+                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Contract: <b style="color:#ffffff;">{cand_sym}</b></p>'
+                f'<p style="color:#3498db; font-size:12px; margin-bottom:4px;">Stability: <b>{confirmations_status}</b></p>'
+                f'<p style="color:#57606a; font-size:11px; margin-top:6px;">Gate Info: {gate_msg}</p>'
+                f'</div>'
             )
+            st.markdown(card_html, unsafe_allow_html=True)
 
     else:
         st.warning(f"Connecting to Upstox market feed for {selected_index}...")
