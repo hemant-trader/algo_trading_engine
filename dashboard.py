@@ -179,7 +179,6 @@ def get_nearest_expiry():
 st.sidebar.title("⚙️ System & Trade Control")
 st.sidebar.markdown("---")
 
-# Restored Live / Watch Mode Toggle
 trade_mode = st.sidebar.radio(
     "Execution State",
     [
@@ -381,7 +380,6 @@ if "access_token" in st.session_state:
             # Strict Safety Gate Enforcement
             if passed and is_ready and composite_score >= 75.0 and market_dir != MarketDirection.NEUTRAL:
                 final_action = f"BUY {chosen_opt_type.value}"
-                # Red font for BUY PE, Green font for BUY CE
                 action_color = "#ff4b4b" if chosen_opt_type == OptionType.PE else "#2ecc71"
             else:
                 final_action = "NO TRADE"
@@ -431,7 +429,7 @@ if "access_token" in st.session_state:
 
             card_html = (
                 f'<div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border:1px solid #363c4e;">'
-                f'<h3 style="color:#b2b9c7; margin-bottom:2px; font-size:18px;">⚡ Engine Signal</h3>'
+                f'<h3 style="color:#b2b9c7; margin-bottom:2px; font-size:18px;">⚡ Engine Signal ({selected_index})</h3>'
                 f'<h1 style="color:{action_color}; font-size:32px; margin-top:2px; margin-bottom:12px; font-weight:bold;">{final_action}</h1>'
                 f'<div style="display:flex; justify-content:space-around; margin-bottom:12px;">'
                 f'<div style="background-color:#14171f; padding:6px 12px; border-radius:6px; border:1px solid #2a2e39;">'
