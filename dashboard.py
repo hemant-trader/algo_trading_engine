@@ -206,8 +206,7 @@ if "access_token" in st.session_state:
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
 
-        # ---------------- BEST OTM (SWEET SPOT) CALCULATION ----------------
-        # CE ke liye 1 step OTM = ATM + step, PE ke liye 1 step OTM = ATM - step
+        # 3. Best Out-of-the-Money Strike Calculation
         if chosen_opt_type == OptionType.CE:
             otm_strike = atm_strike + strike_interval
         else:
@@ -302,38 +301,31 @@ if "access_token" in st.session_state:
                 f"{candidate.confirmation_count}/3 Confirmed" 
                 if candidate else "0/3 Confirmed"
             )
-            st.markdown(
-                f"""
-                <div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border: 1px solid #363c4e;">
-                    <h3 style="color:#b2b9c7; margin-bottom: 2px;">⚡ Engine Signal</h3>
-                    <h1 style="color:{action_color}; font-size: 32px; margin-top:2px; margin-bottom:6px; font-weight: bold;">{final_action}</h1>
-                    <div style="background-color:#14171f; padding:6px 10px; border-radius:6px; margin-bottom:8px; display:inline-block; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:12px;">Signal Confidence: </span>
-                        <b style="color:{conf_color}; font-size:15px;">{confidence_pct:.1f}%</b>
-                    </div>
-                    
-                    <!-- BEST OTM RECOMMENDATION SECTION -->
-                    <div style="background-color: #161c28; border: 1px dashed #3498db; border-radius: 8px; padding: 10px; margin: 10px 0; text-align: left;">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="color: #64b5f6; font-size: 11px; font-weight: bold; text-transform: uppercase;">🎯 Best Low-Cost OTM</span>
-                            <span style="background-color: #0d47a1; color: #bbdefb; font-size: 10px; padding: 2px 6px; border-radius: 4px;">High ROI</span>
-                        </div>
-                        <div style="font-size: 15px; font-weight: bold; color: #ffffff; margin-top: 4px;">
-                            {otm_clean_symbol}
-                        </div>
-                        <div style="color: #90caf9; font-size: 11px; margin-top: 2px;">
-                            Low Risk • Delta: ~0.35 • Fast Move Multiplier
-                        </div>
-                    </div>
+            cand_sym = candidate.symbol if candidate else "Scanning"
 
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Consensus Direction: <b>{market_dir.name}</b></p>
-                    <p style="color:#848d9c; margin-bottom: 2px; font-size:13px;">Candidate (ATM): <b>{candidate.symbol if candidate else 'Scanning'}</b></p>
-                    <p style="color:#3498db; font-size: 12px; margin-bottom: 2px;">Stability: <b>{confirmations_status}</b></p>
-                    <p style="color:#57606a; font-size: 11px; margin-top: 4px;">Gate Status: {gate_msg}</p>
-                </div>
-                """,
-                unsafe_allow_html=True
+            card_html = (
+                f'<div style="background-color:#1e222d; padding:18px; border-radius:12px; text-align:center; border:1px solid #363c4e;">'
+                f'<h3 style="color:#b2b9c7; margin:0 0 4px 0; font-size:18px;">⚡ Engine Signal</h3>'
+                f'<h1 style="color:{action_color}; font-size:32px; margin:0 0 6px 0; font-weight:bold;">{final_action}</h1>'
+                f'<div style="background-color:#14171f; padding:4px 10px; border-radius:6px; margin-bottom:8px; display:inline-block; border:1px solid #2a2e39;">'
+                f'<span style="color:#848d9c; font-size:12px;">Signal Confidence: </span>'
+                f'<b style="color:{conf_color}; font-size:14px;">{confidence_pct:.1f}%</b>'
+                f'</div>'
+                f'<div style="background-color:#161c28; border:1px dashed #3498db; border-radius:8px; padding:8px 10px; margin-bottom:8px; text-align:left;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                f'<span style="color:#64b5f6; font-size:11px; font-weight:bold;">🎯 BEST LOW-COST OTM</span>'
+                f'<span style="background-color:#0d47a1; color:#bbdefb; font-size:10px; padding:1px 5px; border-radius:3px;">High ROI</span>'
+                f'</div>'
+                f'<div style="font-size:15px; font-weight:bold; color:#ffffff; margin:3px 0;">{otm_clean_symbol}</div>'
+                f'<div style="color:#90caf9; font-size:11px;">Low Risk • Delta: ~0.35 • Momentum Pick</div>'
+                f'</div>'
+                f'<p style="color:#848d9c; margin:2px 0; font-size:13px;">Consensus Direction: <b>{market_dir.name}</b></p>'
+                f'<p style="color:#848d9c; margin:2px 0; font-size:13px;">Candidate (ATM): <b>{cand_sym}</b></p>'
+                f'<p style="color:#3498db; font-size:12px; margin:2px 0;">Stability: <b>{confirmations_status}</b></p>'
+                f'<p style="color:#57606a; font-size:11px; margin-top:4px;">Gate Status: {gate_msg}</p>'
+                f'</div>'
             )
+            st.markdown(card_html, unsafe_allow_html=True)
 
     else:
         st.warning(f"Connecting to Upstox market feed for {selected_index}...")
