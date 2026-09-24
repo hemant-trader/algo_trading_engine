@@ -1,93 +1,99 @@
-from typing import Optional
-from core.types import CandidateState, OptionType, MarketDirection
+import time
+from dataclasses import dataclass
+from typing import Optional, Tuple
+from core.types import OptionType, MarketDirection, CandidateState
 
 class CandidateHysteresisTracker:
-    def __init__(
-        self, 
-        hysteresis_threshold: float = 5.0, 
-        min_confirmations: int = 3, 
-        max_confirmations: int = 10,
-        min_score_threshold: float = 80.0
-    ):
-        self.threshold: float = hysteresis_threshold
-        self.min_confirmations: int = min_confirmations
-        self.max_confirmations: int = max_confirmations
-        self.min_score_threshold: float = min_score_threshold
+    def __init__(self, hysteresis_threshold: float = 5.0, min_confirmations: int = 3):
+        self.hysteresis_threshold = hysteresis_threshold
+        self.min_confirmations = min_confirmations
         self.active_candidate: Optional[CandidateState] = None
-        self.last_direction: Optional[MarketDirection] = None
+        self.pending_candidate: Optional[CandidateState] = None
+
+    def flush(self) -> None:
+        """Clears candidate states on Neutral or Direction Flip."""
+        self.active_candidate = None
+        self.pending_candidate = None
 
     def process_candidate(
-        self, 
-        new_symbol: str, 
-        new_strike: float, 
-        new_option_type: OptionType, 
-        new_score: float,
-        market_direction: Optional[MarketDirection] = None
-    ) -> tuple[Optional[CandidateState], bool]:
-        
-        # 1. Hard Invariant: Direction Flip par Instant Full Reset
-        if market_direction is not None and self.last_direction is not None:
-            if market_direction != self.last_direction:
+        self,
+        symbol: str,
+        strike: float,
+        option_type: OptionType,
+        score: float,
+        direction: MarketDirection = MarketDirection.NEUTRAL
+    ) -> Tuple[Optional[CandidateState], bool]:
+        current_time = time.time()
+
+        if direction == MarketDirection.NEUTRAL:
+            self.flush()
+            return None, False
+
+        # Direction flip reset (CE <-> PE switch)
+        if self.active_candidate is not None:
+            if self.active_candidate.direction != direction or self.active_candidate.option_type != option_type:
                 self.flush()
-                self.last_direction = market_direction
-                return None, False
-        if market_direction is not None:
-            self.last_direction = market_direction
 
-        # 2. Score Threshold Hard Gate (< 80.0 eligible nahi hoga)
-        if new_score < self.min_score_threshold:
-            if self.active_candidate:
-                self.active_candidate.confirmation_count = max(0, self.active_candidate.confirmation_count - 1)
-            return self.active_candidate, False
-
-        # 3. Initialize First Candidate
+        # Case A: No active candidate yet
         if self.active_candidate is None:
-            self.active_candidate = CandidateState(
-                symbol=new_symbol,
-                strike=new_strike,
-                option_type=new_option_type,
-                score=new_score,
-                confirmation_count=1
-            )
-            return self.active_candidate, False
+            if self.pending_candidate is None or self.pending_candidate.symbol != symbol:
+                self.pending_candidate = CandidateState(
+                    symbol=symbol,
+                    strike=strike,
+                    option_type=option_type,
+                    composite_score=score,
+                    confirmation_count=1,
+                    first_seen_time=current_time,
+                    last_seen_time=current_time,
+                    direction=direction
+                )
+            else:
+                self.pending_candidate.confirmation_count += 1
+                self.pending_candidate.composite_score = score
+                self.pending_candidate.last_seen_time = current_time
 
-        # 4. Hard Option Type Inversion (CE <-> PE switch par reset)
-        if self.active_candidate.option_type != new_option_type:
-            self.active_candidate = CandidateState(
-                symbol=new_symbol,
-                strike=new_strike,
-                option_type=new_option_type,
-                score=new_score,
-                confirmation_count=1
-            )
-            return self.active_candidate, False
+            if self.pending_candidate.confirmation_count >= self.min_confirmations:
+                self.active_candidate = self.pending_candidate
+                self.pending_candidate = None
+                return self.active_candidate, True
 
-        # 5. Same Strike Re-confirmation (Consecutive Tick Confirmation)
-        if self.active_candidate.symbol == new_symbol:
-            self.active_candidate.score = new_score
-            if self.active_candidate.confirmation_count < self.max_confirmations:
-                self.active_candidate.confirmation_count += 1
+            return self.pending_candidate, False
+
+        # Case B: Active candidate re-confirmation
+        if self.active_candidate.symbol == symbol:
+            self.active_candidate.confirmation_count = min(
+                self.active_candidate.confirmation_count + 1, self.min_confirmations
+            )
+            self.active_candidate.composite_score = score
+            self.active_candidate.last_seen_time = current_time
+            self.pending_candidate = None
             is_ready = self.active_candidate.confirmation_count >= self.min_confirmations
             return self.active_candidate, is_ready
 
-        # 6. Competing Strike with +5.0 Hysteresis Barrier
-        score_diff = new_score - self.active_candidate.score
-        if score_diff >= self.threshold:
-            self.active_candidate = CandidateState(
-                symbol=new_symbol,
-                strike=new_strike,
-                option_type=new_option_type,
-                score=new_score,
-                confirmation_count=1
-            )
-            return self.active_candidate, False
+        # Case C: New challenger candidate with +5 hysteresis
+        if score >= (self.active_candidate.composite_score + self.hysteresis_threshold):
+            if self.pending_candidate is None or self.pending_candidate.symbol != symbol:
+                self.pending_candidate = CandidateState(
+                    symbol=symbol,
+                    strike=strike,
+                    option_type=option_type,
+                    composite_score=score,
+                    confirmation_count=1,
+                    first_seen_time=current_time,
+                    last_seen_time=current_time,
+                    direction=direction
+                )
+            else:
+                self.pending_candidate.confirmation_count += 1
+                self.pending_candidate.composite_score = score
+                self.pending_candidate.last_seen_time = current_time
 
-        # 7. Suppress flickering competitor ticks
-        if self.active_candidate.confirmation_count > 1:
-            self.active_candidate.confirmation_count -= 1
-        is_ready = self.active_candidate.confirmation_count >= self.min_confirmations
-        return self.active_candidate, is_ready
+            if self.pending_candidate.confirmation_count >= self.min_confirmations:
+                self.active_candidate = self.pending_candidate
+                self.pending_candidate = None
+                return self.active_candidate, True
 
-    def flush(self) -> None:
-        """Flushes active state to NO TRADE instantly."""
-        self.active_candidate = None
+            return self.active_candidate, (self.active_candidate.confirmation_count >= self.min_confirmations)
+
+        self.pending_candidate = None
+        return self.active_candidate, (self.active_candidate.confirmation_count >= self.min_confirmations)
