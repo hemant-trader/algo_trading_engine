@@ -2,6 +2,7 @@ import os
 import json
 import time
 import datetime
+import zoneinfo
 import requests
 import urllib.parse
 import pandas as pd
@@ -19,6 +20,7 @@ from engine.safety_gate import ZeroTrustFinalSafetyGate
 st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 
 TOKEN_FILE = "access_token.json"
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 INDEX_CONFIG = {
     "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50, "sideways_range": 25.0},
@@ -26,7 +28,6 @@ INDEX_CONFIG = {
     "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100, "sideways_range": 80.0},
 }
 
-# --- State Persistence Setup ---
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = "NIFTY 50"
 if "price_history" not in st.session_state:
@@ -34,12 +35,11 @@ if "price_history" not in st.session_state:
 if "tick_guard" not in st.session_state:
     st.session_state["tick_guard"] = TickGuardEngine()
 if "candidate_tracker" not in st.session_state:
-    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(
-        hysteresis_threshold=5.0, 
-        min_confirmations=3
-    )
+    st.session_state["candidate_tracker"] = CandidateHysteresisTracker()
 if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=5)
+if "seq_counter" not in st.session_state:
+    st.session_state["seq_counter"] = 1000
 
 def save_token_to_file(token_data):
     with open(TOKEN_FILE, "w") as f:
@@ -82,7 +82,6 @@ def get_market_quote(instrument_key, token):
     return None
 
 def get_option_chain_data(instrument_key, expiry_date, token):
-    """Fetches real live option chain depth from Upstox API."""
     url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}"
     headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
@@ -94,6 +93,44 @@ def get_option_chain_data(instrument_key, expiry_date, token):
     except Exception:
         return None
     return None
+
+def get_option_contracts(instrument_key, token):
+    url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
+    headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=4)
+        if response.status_code == 200:
+            res = response.json()
+            if res.get("status") == "success" and "data" in res:
+                return res["data"]
+    except Exception:
+        return None
+    return None
+
+def resolve_nearest_expiry(instrument_key, token):
+    contracts = get_option_contracts(instrument_key, token)
+    if contracts:
+        today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+        valid_expiries = sorted([c["expiry"] for c in contracts if c.get("expiry") and c["expiry"] >= today_str])
+        if valid_expiries:
+            return valid_expiries[0]
+    
+    # Safe Fallback
+    today = datetime.date.today()
+    days_ahead = (3 - today.weekday()) % 7
+    return (today + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+def calculate_precise_tte(expiry_str):
+    try:
+        now_ist = datetime.datetime.now(IST)
+        exp_date = datetime.datetime.strptime(expiry_str, "%Y-%m-%d").date()
+        exp_cutoff_ist = datetime.datetime(
+            exp_date.year, exp_date.month, exp_date.day, 15, 30, 0, tzinfo=IST
+        )
+        total_seconds = max(60.0, (exp_cutoff_ist - now_ist).total_seconds())
+        return total_seconds / (365.0 * 86400.0)
+    except Exception:
+        return 0.005
 
 saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
@@ -152,12 +189,6 @@ def evaluate_regime_and_direction(price_history, selected_index):
     if price_spread <= threshold_range and abs(momentum_pct) < 0.04:
         return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
 
-    # Normalized 7-Point Scoring Weight Architecture
-    # 1. EMA Trend Alignment: 2 pts
-    # 2. Price Momentum Velocity: 2 pts
-    # 3. Position vs Short EMA: 1 pt
-    # 4. RSI Directional Confirmation: 2 pts
-    # Total Max Possible Score = 7 pts
     bull_score = 0
     bear_score = 0
 
@@ -181,32 +212,16 @@ def evaluate_regime_and_direction(price_history, selected_index):
     elif rsi <= 45.0:
         bear_score += 2
 
-    TOTAL_MAX_SCORE = 7.0
+    TOTAL_POINTS = 7.0
 
     if bull_score >= 5 and bull_score >= (bear_score + 2):
-        trend_strength = (bull_score / TOTAL_MAX_SCORE) * 100.0
+        trend_strength = (bull_score / TOTAL_POINTS) * 100.0
         return MarketDirection.BULLISH, trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range
     elif bear_score >= 5 and bear_score >= (bull_score + 2):
-        trend_strength = (bear_score / TOTAL_MAX_SCORE) * 100.0
+        trend_strength = (bear_score / TOTAL_POINTS) * 100.0
         return MarketDirection.BEARISH, trend_strength, rsi, price_spread, "TRENDING_BEARISH", threshold_range
 
     return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
-
-def get_exact_tte(expiry_str):
-    try:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        exp_dt = datetime.datetime.strptime(expiry_str, "%Y-%m-%d").replace(
-            hour=10, minute=0, second=0, tzinfo=datetime.timezone.utc
-        )
-        diff_sec = max(0.0, (exp_dt - now).total_seconds())
-        return diff_sec / (365.0 * 86400.0)
-    except Exception:
-        return 0.015
-
-def get_nearest_expiry():
-    today = datetime.date.today()
-    days_ahead = (3 - today.weekday()) % 7
-    return (today + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
 
 # ================= SIDEBAR CONTROLS =================
 st.sidebar.title("⚙️ System & Trade Control")
@@ -281,9 +296,9 @@ st.title("⚡ Hemant Algo Trading Engine")
 
 is_live_execution = "🟢 ON" in trade_mode
 if is_live_execution:
-    st.error("🚨 **LIVE AUTO-EXECUTION ARMED:** Orders will route to broker when Zero-Trust Gate passes.")
+    st.warning("⚠️ **SIGNAL EXECUTION MONITOR:** Mode armed (Auto-order routing interface is isolated for verification).")
 else:
-    st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate is strictly enforced (No real orders placed).")
+    st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate strictly enforced.")
 
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
@@ -301,6 +316,9 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 50:
             st.session_state["price_history"].pop(0)
 
+        st.session_state["seq_counter"] += 1
+        current_seq = st.session_state["seq_counter"]
+
         market_dir, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
             st.session_state["price_history"], selected_index
         )
@@ -310,10 +328,12 @@ if "access_token" in st.session_state:
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
         current_time = time.time()
-        active_expiry = get_nearest_expiry()
-        exact_tte = get_exact_tte(active_expiry)
+        
+        # Real Metadata Expiry Resolution & Exact IST TTE
+        active_expiry = resolve_nearest_expiry(inst_key, token)
+        exact_tte = calculate_precise_tte(active_expiry)
 
-        # 2-Stage Momentum Classification
+        # 2-Stage Confirmation Parameter Set
         is_strong_momentum = (
             (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
             (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
@@ -390,8 +410,11 @@ if "access_token" in st.session_state:
                         real_ask = float(market_data.get("ask_price", 0.0))
                         real_oi = int(opt_info.get("oi", 0))
                         real_vol = int(market_data.get("volume", 0))
-                        if opt_info.get("option_greeks", {}).get("iv"):
-                            chain_iv = float(opt_info["option_greeks"]["iv"]) / 100.0
+                        
+                        raw_iv = opt_info.get("option_greeks", {}).get("iv", 0.0)
+                        if raw_iv and raw_iv > 0:
+                            # Auto-detect whether IV is provided as percentage or fraction
+                            chain_iv = (raw_iv / 100.0) if raw_iv > 1.5 else raw_iv
                         feed_source = "UPSTOX_LIVE_CHAIN"
                         break
 
@@ -419,7 +442,7 @@ if "access_token" in st.session_state:
                 oi_change_pct=0.0,
                 iv=chain_iv,
                 timestamp=current_time,
-                sequence_no=int(current_time),
+                sequence_no=current_seq,
                 tte=exact_tte,
                 data_source=feed_source
             )
@@ -442,7 +465,6 @@ if "access_token" in st.session_state:
             st.session_state["ttl_manager"].pulse(True)
 
             if greeks is not None:
-                # Strong breakdown/breakout enforces tight delta gate (0.45 - 0.65)
                 passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
                     market_direction=market_dir,
                     tick=tick,
@@ -454,7 +476,7 @@ if "access_token" in st.session_state:
                     max_spread_pct=0.03
                 )
                 
-                # Additional 2-Stage Delta Filter for High Momentum
+                # Strict Delta Bounds Verification
                 if passed and is_strong_momentum:
                     abs_delta = abs(greeks.delta)
                     if abs_delta < 0.40 or abs_delta > 0.70:
@@ -464,7 +486,6 @@ if "access_token" in st.session_state:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
 
-            # 2-Stage Execution Trigger Logic
             if passed and is_ready and composite_score >= required_min_score and market_dir != MarketDirection.NEUTRAL:
                 final_action = f"BUY {chosen_opt_type.value}"
                 action_color = "#ff4b4b" if chosen_opt_type == OptionType.PE else "#2ecc71"
