@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import secrets
 import datetime
 import zoneinfo
 import requests
@@ -115,7 +116,6 @@ def resolve_nearest_expiry(instrument_key, token):
         if valid_expiries:
             return valid_expiries[0]
     
-    # Safe Fallback
     today = datetime.date.today()
     days_ahead = (3 - today.weekday()) % 7
     return (today + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
@@ -136,13 +136,21 @@ saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
     st.session_state["access_token"] = saved_token_data["access_token"]
 
+# OAuth CSRF State Validation
 query_params = st.query_params
 auth_code = query_params.get("code", None)
+incoming_state = query_params.get("state", None)
+
 if auth_code and "access_token" not in st.session_state:
-    res = get_access_token(auth_code)
-    if "access_token" in res:
-        st.session_state["access_token"] = res["access_token"]
-        save_token_to_file(res)
+    expected_state = st.session_state.get("oauth_state")
+    if expected_state and incoming_state != expected_state:
+        st.error("OAuth State Validation Failed. Possible CSRF interception.")
+        st.stop()
+    else:
+        res = get_access_token(auth_code)
+        if "access_token" in res:
+            st.session_state["access_token"] = res["access_token"]
+            save_token_to_file(res)
 
 # ================= TECHNICAL ENGINE =================
 def calculate_rsi(price_history, period=14):
@@ -174,7 +182,7 @@ def calculate_realized_volatility(price_history):
 def evaluate_regime_and_direction(price_history, selected_index):
     threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
     if len(price_history) < 15:
-        return MarketDirection.NEUTRAL, 0.0, 50.0, 0.0, "INSUFFICIENT_DATA", threshold_range
+        return MarketDirection.NEUTRAL, 0, 0.0, 50.0, 0.0, "INSUFFICIENT_DATA", threshold_range
 
     s = pd.Series(price_history)
     price_spread = float(s.max() - s.min())
@@ -187,7 +195,7 @@ def evaluate_regime_and_direction(price_history, selected_index):
     rsi = calculate_rsi(price_history, period=min(14, len(price_history)-1))
 
     if price_spread <= threshold_range and abs(momentum_pct) < 0.04:
-        return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
+        return MarketDirection.NEUTRAL, 0, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
 
     bull_score = 0
     bear_score = 0
@@ -212,16 +220,16 @@ def evaluate_regime_and_direction(price_history, selected_index):
     elif rsi <= 45.0:
         bear_score += 2
 
-    TOTAL_POINTS = 7.0
+    TOTAL_MAX_POINTS = 7.0
 
     if bull_score >= 5 and bull_score >= (bear_score + 2):
-        trend_strength = (bull_score / TOTAL_POINTS) * 100.0
-        return MarketDirection.BULLISH, trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range
+        trend_strength = (bull_score / TOTAL_MAX_POINTS) * 100.0
+        return MarketDirection.BULLISH, bull_score, trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range
     elif bear_score >= 5 and bear_score >= (bull_score + 2):
-        trend_strength = (bear_score / TOTAL_POINTS) * 100.0
-        return MarketDirection.BEARISH, trend_strength, rsi, price_spread, "TRENDING_BEARISH", threshold_range
+        trend_strength = (bear_score / TOTAL_MAX_POINTS) * 100.0
+        return MarketDirection.BEARISH, bear_score, trend_strength, rsi, price_spread, "TRENDING_BEARISH", threshold_range
 
-    return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
+    return MarketDirection.NEUTRAL, 0, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
 
 # ================= SIDEBAR CONTROLS =================
 st.sidebar.title("⚙️ System & Trade Control")
@@ -231,7 +239,7 @@ trade_mode = st.sidebar.radio(
     "Execution State",
     [
         "🔴 OFF: Watch & Signal Mode (Paper Mode)",
-        "🟢 ON: Live Auto-Trading Execution Mode"
+        "🟡 ARMED: Execution Simulation / Paper Monitor"
     ],
     index=0
 )
@@ -264,11 +272,14 @@ target_pnl = st.sidebar.number_input("Daily Target PnL (₹)", value=4000)
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔑 Broker Authentication")
 if "access_token" not in st.session_state:
+    if "oauth_state" not in st.session_state:
+        st.session_state["oauth_state"] = secrets.token_urlsafe(32)
     base_url = "https://api.upstox.com/v2/login/authorization/dialog"
     params = {
         "response_type": "code",
         "client_id": UPSTOX_CONFIG["API_KEY"],
-        "redirect_uri": UPSTOX_CONFIG["REDIRECT_URI"]
+        "redirect_uri": UPSTOX_CONFIG["REDIRECT_URI"],
+        "state": st.session_state["oauth_state"]
     }
     login_url = f"{base_url}?{urllib.parse.urlencode(params)}"
     st.sidebar.link_button("Login with Upstox", login_url)
@@ -294,9 +305,9 @@ else:
 # ================= MAIN RUNTIME =================
 st.title("⚡ Hemant Algo Trading Engine")
 
-is_live_execution = "🟢 ON" in trade_mode
-if is_live_execution:
-    st.warning("⚠️ **SIGNAL EXECUTION MONITOR:** Mode armed (Auto-order routing interface is isolated for verification).")
+is_armed_simulation = "🟡 ARMED" in trade_mode
+if is_armed_simulation:
+    st.warning("⚠️ **ARMED SIMULATION MONITOR:** Signal logic is live with broker data verification (Execution isolated).")
 else:
     st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate strictly enforced.")
 
@@ -319,21 +330,20 @@ if "access_token" in st.session_state:
         st.session_state["seq_counter"] += 1
         current_seq = st.session_state["seq_counter"]
 
-        market_dir, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
+        market_dir, raw_points, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
             st.session_state["price_history"], selected_index
         )
 
-        display_iv = calculate_realized_volatility(st.session_state["price_history"])
+        realized_vol = calculate_realized_volatility(st.session_state["price_history"])
 
         strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
         current_time = time.time()
         
-        # Real Metadata Expiry Resolution & Exact IST TTE
         active_expiry = resolve_nearest_expiry(inst_key, token)
         exact_tte = calculate_precise_tte(active_expiry)
 
-        # 2-Stage Confirmation Parameter Set
+        # 2-Stage Confirmation
         is_strong_momentum = (
             (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
             (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
@@ -383,6 +393,7 @@ if "access_token" in st.session_state:
         gate_msg = "NEUTRAL_REGIME_STANDBY"
         final_action = "NO TRADE"
         action_color = "#f1c40f"
+        chain_iv_val = realized_vol / 100.0
 
         if market_dir != MarketDirection.NEUTRAL:
             symbol_prefix = selected_index.replace(" ", "").upper()
@@ -394,9 +405,12 @@ if "access_token" in st.session_state:
             real_ltp = 0.0
             real_bid = 0.0
             real_ask = 0.0
+            real_bid_qty = 0
+            real_ask_qty = 0
             real_oi = 0
+            real_prev_oi = 0
             real_vol = 0
-            chain_iv = display_iv / 100.0
+            upstox_delta = None
             feed_source = "SPOT_FALLBACK"
 
             if chain_data:
@@ -405,16 +419,24 @@ if "access_token" in st.session_state:
                         opt_key = "call_options" if chosen_opt_type == OptionType.CE else "put_options"
                         opt_info = row.get(opt_key, {})
                         market_data = opt_info.get("market_data", {})
+                        greeks_data = opt_info.get("option_greeks", {})
+                        
                         real_ltp = float(market_data.get("ltp", 0.0))
                         real_bid = float(market_data.get("bid_price", 0.0))
                         real_ask = float(market_data.get("ask_price", 0.0))
-                        real_oi = int(opt_info.get("oi", 0))
+                        real_bid_qty = int(market_data.get("bid_qty", 0))
+                        real_ask_qty = int(market_data.get("ask_qty", 0))
+                        real_oi = int(market_data.get("oi", 0))
+                        real_prev_oi = int(market_data.get("prev_oi", 0))
                         real_vol = int(market_data.get("volume", 0))
                         
-                        raw_iv = opt_info.get("option_greeks", {}).get("iv", 0.0)
+                        raw_iv = greeks_data.get("iv", 0.0)
                         if raw_iv and raw_iv > 0:
-                            # Auto-detect whether IV is provided as percentage or fraction
-                            chain_iv = (raw_iv / 100.0) if raw_iv > 1.5 else raw_iv
+                            chain_iv_val = (raw_iv / 100.0) if raw_iv > 1.5 else raw_iv
+                        
+                        if greeks_data.get("delta") is not None:
+                            upstox_delta = float(greeks_data["delta"])
+
                         feed_source = "UPSTOX_LIVE_CHAIN"
                         break
 
@@ -430,25 +452,25 @@ if "access_token" in st.session_state:
                 bid=real_bid,
                 ask=real_ask,
                 spread=max(0.0, real_ask - real_bid),
-                bid_qty=0,
-                ask_qty=0,
+                bid_qty=real_bid_qty,
+                ask_qty=real_ask_qty,
                 volume=real_vol,
                 oi=real_oi,
-                previous_oi=0,
+                previous_oi=real_prev_oi,
                 volume_change=0,
-                oi_change=0,
+                oi_change=real_oi - real_prev_oi,
                 price_change=0.0,
                 price_change_pct=0.0,
                 oi_change_pct=0.0,
-                iv=chain_iv,
+                iv=chain_iv_val,
                 timestamp=current_time,
                 sequence_no=current_seq,
                 tte=exact_tte,
                 data_source=feed_source
             )
 
-            greeks = BlackScholesEngine.calculate_greeks(
-                spot_ltp, tick.strike, tick.tte, 0.07, chain_iv, tick.option_type
+            bs_greeks = BlackScholesEngine.calculate_greeks(
+                spot_ltp, tick.strike, tick.tte, 0.07, chain_iv_val, tick.option_type
             )
 
             composite_score = float(trend_strength)
@@ -464,11 +486,11 @@ if "access_token" in st.session_state:
 
             st.session_state["ttl_manager"].pulse(True)
 
-            if greeks is not None:
+            if bs_greeks is not None:
                 passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
                     market_direction=market_dir,
                     tick=tick,
-                    greeks=greeks,
+                    greeks=bs_greeks,
                     candidate=candidate,
                     candidate_ready=is_ready,
                     ttl_state=st.session_state["ttl_manager"],
@@ -476,12 +498,19 @@ if "access_token" in st.session_state:
                     max_spread_pct=0.03
                 )
                 
-                # Strict Delta Bounds Verification
-                if passed and is_strong_momentum:
-                    abs_delta = abs(greeks.delta)
-                    if abs_delta < 0.40 or abs_delta > 0.70:
+                # Dual-Greeks Cross Validation
+                if passed and upstox_delta is not None:
+                    delta_diff = abs(abs(upstox_delta) - abs(bs_greeks.delta))
+                    if delta_diff > 0.08:
                         passed = False
-                        gate_msg = f"BLOCKED_DELTA_STRICT: Fast momentum requires delta 0.40-0.70 (got {abs_delta:.2f})"
+                        gate_msg = f"BLOCKED_GREEKS_DISCREPANCY: Broker vs BS Delta skew ({delta_diff:.2f})"
+
+                # Strict Delta Bounds: 0.45 <= |delta| <= 0.65
+                if passed and is_strong_momentum:
+                    abs_delta = abs(bs_greeks.delta)
+                    if abs_delta < 0.45 or abs_delta > 0.65:
+                        passed = False
+                        gate_msg = f"BLOCKED_DELTA_BOUNDS: Fast momentum requires 0.45-0.65 (got {abs_delta:.2f})"
             else:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
@@ -514,10 +543,11 @@ if "access_token" in st.session_state:
             )
             st.markdown(regime_html, unsafe_allow_html=True)
 
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric(label=f"{selected_index} Spot", value=f"₹{spot_ltp:,.2f}")
             m2.metric(label="Calculated RSI (14)", value=f"{rsi_val:.1f}")
-            m3.metric(label="Implied Volatility (IV)", value=f"{display_iv:.2f}%")
+            m3.metric(label="Option Chain IV", value=f"{chain_iv_val * 100:.2f}%")
+            m4.metric(label="Realized Volatility", value=f"{realized_vol:.2f}%")
 
             st.markdown("---")
             st.subheader(f"📈 Real Tick Feed: {selected_index}")
@@ -529,7 +559,7 @@ if "access_token" in st.session_state:
                 f"{candidate.confirmation_count}/{required_confirmations} Confirmed" 
                 if candidate else f"0/{required_confirmations} Confirmed"
             )
-            score_display = f"{trend_strength:.1f}%" if market_dir != MarketDirection.NEUTRAL else "0.0%"
+            score_display = f"{raw_points}/7 ({trend_strength:.1f}%)" if market_dir != MarketDirection.NEUTRAL else "0/7 (0.0%)"
             score_color = "#2ecc71" if trend_strength >= required_min_score else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
             gate_badge = "PASSED" if passed else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed else "#e74c3c"
