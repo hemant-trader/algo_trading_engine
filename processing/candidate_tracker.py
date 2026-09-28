@@ -1,19 +1,17 @@
 import time
-from dataclasses import dataclass
 from typing import Optional, Tuple
 from core.types import OptionType, MarketDirection, CandidateState
 
 class CandidateHysteresisTracker:
-    def __init__(self, hysteresis_threshold: float = 5.0, min_confirmations: int = 3):
+    def __init__(self, hysteresis_threshold: float = 5.0, default_confirmations: int = 3):
         self.hysteresis_threshold = hysteresis_threshold
-        self.min_confirmations = min_confirmations
+        self.default_confirmations = default_confirmations
         self.active_candidate: Optional[CandidateState] = None
         self.pending_candidate: Optional[CandidateState] = None
         self.last_flip_time: float = 0.0
-        self.flip_cooldown_seconds: float = 15.0  # Prevent CE <-> PE whipsaw oscillation
+        self.flip_cooldown_seconds: float = 12.0
 
     def flush(self) -> None:
-        """Clears candidate states on Neutral or explicit reset."""
         self.active_candidate = None
         self.pending_candidate = None
 
@@ -24,27 +22,24 @@ class CandidateHysteresisTracker:
         option_type: OptionType,
         score: float,
         direction: MarketDirection = MarketDirection.NEUTRAL,
-        required_confirmations: Optional[int] = None
+        required_confirmations: int = 3
     ) -> Tuple[Optional[CandidateState], bool]:
         current_time = time.time()
-        effective_min_conf = required_confirmations or self.min_confirmations
 
         if direction == MarketDirection.NEUTRAL:
             self.flush()
             return None, False
 
-        # Direction flip guard (CE <-> PE switch)
+        # Direction flip detection
         if self.active_candidate is not None:
             if self.active_candidate.direction != direction or self.active_candidate.option_type != option_type:
                 self.flush()
                 self.last_flip_time = current_time
-                return None, False
 
-        # Anti-oscillation flip cooldown: Reject immediate fast re-entry after a flip
-        if (current_time - self.last_flip_time) < self.flip_cooldown_seconds:
-            return None, False
+        # Flip cooldown check
+        in_cooldown = (current_time - self.last_flip_time) < self.flip_cooldown_seconds
 
-        # Case A: No active candidate yet
+        # Case A: No active candidate
         if self.active_candidate is None:
             if self.pending_candidate is None or self.pending_candidate.symbol != symbol:
                 self.pending_candidate = CandidateState(
@@ -62,7 +57,8 @@ class CandidateHysteresisTracker:
                 self.pending_candidate.composite_score = score
                 self.pending_candidate.last_seen_time = current_time
 
-            if self.pending_candidate.confirmation_count >= effective_min_conf:
+            # Only promote if required confirmations met AND not in cooldown
+            if self.pending_candidate.confirmation_count >= required_confirmations and not in_cooldown:
                 self.active_candidate = self.pending_candidate
                 self.pending_candidate = None
                 return self.active_candidate, True
@@ -72,12 +68,12 @@ class CandidateHysteresisTracker:
         # Case B: Active candidate re-confirmation
         if self.active_candidate.symbol == symbol:
             self.active_candidate.confirmation_count = min(
-                self.active_candidate.confirmation_count + 1, effective_min_conf
+                self.active_candidate.confirmation_count + 1, 10
             )
             self.active_candidate.composite_score = score
             self.active_candidate.last_seen_time = current_time
             self.pending_candidate = None
-            is_ready = self.active_candidate.confirmation_count >= effective_min_conf
+            is_ready = (self.active_candidate.confirmation_count >= required_confirmations) and not in_cooldown
             return self.active_candidate, is_ready
 
         # Case C: New challenger candidate with +5 hysteresis
@@ -98,12 +94,12 @@ class CandidateHysteresisTracker:
                 self.pending_candidate.composite_score = score
                 self.pending_candidate.last_seen_time = current_time
 
-            if self.pending_candidate.confirmation_count >= effective_min_conf:
+            if self.pending_candidate.confirmation_count >= required_confirmations and not in_cooldown:
                 self.active_candidate = self.pending_candidate
                 self.pending_candidate = None
                 return self.active_candidate, True
 
-            return self.active_candidate, (self.active_candidate.confirmation_count >= effective_min_conf)
+            return self.active_candidate, (self.active_candidate.confirmation_count >= required_confirmations)
 
         self.pending_candidate = None
-        return self.active_candidate, (self.active_candidate.confirmation_count >= effective_min_conf)
+        return self.active_candidate, (self.active_candidate.confirmation_count >= required_confirmations)
