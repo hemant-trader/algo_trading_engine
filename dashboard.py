@@ -322,6 +322,49 @@ if "access_token" in st.session_state:
         if key_name in quote_data["data"]:
             spot_ltp = float(quote_data["data"][key_name]["last_price"])
 
+    active_expiry = resolve_nearest_expiry(inst_key, token)
+
+    # ================= PRESENT DATE, TIME & EXPIRY BADGE =================
+    now_ist = datetime.datetime.now(IST)
+    current_date_str = now_ist.strftime("%d %b %Y")
+    current_time_str = now_ist.strftime("%I:%M:%S %p")
+    today_iso = now_ist.strftime("%Y-%m-%d")
+
+    # Format expiry as Day/Month (DD/MM)
+    try:
+        exp_d = datetime.datetime.strptime(active_expiry, "%Y-%m-%d").date()
+        exp_day_month = exp_d.strftime("%d/%m")
+        days_left = (exp_d - now_ist.date()).days
+        days_str = f"({days_left} Days)" if days_left > 0 else ""
+    except Exception:
+        exp_day_month = active_expiry
+        days_str = ""
+
+    if active_expiry == today_iso:
+        expiry_badge_html = """
+        <span style="background-color: #e74c3c; color: #ffffff; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 12px; letter-spacing: 0.5px;">
+            🔥 TODAY EXPIRY (0 DTE)
+        </span>
+        """
+    else:
+        expiry_badge_html = f"""
+        <span style="background-color: #161f30; color: #64ffda; padding: 5px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; border: 1px solid #233554;">
+            📅 Active Expiry: <b style="color:#ffffff;">{exp_day_month}</b> {days_str}
+        </span>
+        """
+
+    time_window_html = f"""
+    <div style="display:flex; justify-content:space-between; align-items:center; background-color:#0d1117; padding:8px 16px; border-radius:8px; border:1px solid #30363d; margin-bottom:12px;">
+        <div style="color:#8b949e; font-size:13px; font-family:monospace;">
+            🕒 <b style="color:#f0f6fc;">{current_date_str}</b> | <span style="color:#58a6ff;">{current_time_str} IST</span>
+        </div>
+        <div>
+            {expiry_badge_html}
+        </div>
+    </div>
+    """
+    st.markdown(time_window_html, unsafe_allow_html=True)
+
     if spot_ltp is not None:
         st.session_state["price_history"].append(spot_ltp)
         if len(st.session_state["price_history"]) > 50:
@@ -340,7 +383,6 @@ if "access_token" in st.session_state:
         atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
         current_time = time.time()
         
-        active_expiry = resolve_nearest_expiry(inst_key, token)
         exact_tte = calculate_precise_tte(active_expiry)
 
         # 2-Stage Confirmation
