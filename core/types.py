@@ -1,20 +1,23 @@
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
+
+class OptionType(Enum):
+    CE = "CE"
+    PE = "PE"
 
 class MarketDirection(Enum):
     BULLISH = "BULLISH"
     BEARISH = "BEARISH"
     NEUTRAL = "NEUTRAL"
 
-class OptionType(Enum):
-    CE = "CE"
-    PE = "PE"
-
-class TradeAction(Enum):
-    BUY = "BUY"
-    NO_TRADE = "NO_TRADE"
-    EXIT = "EXIT"
+@dataclass
+class OptionGreeks:
+    delta: float
+    gamma: float
+    theta: float
+    vega: float
+    rho: float
 
 @dataclass
 class CandidateState:
@@ -27,7 +30,7 @@ class CandidateState:
     last_seen_time: float
     direction: MarketDirection
 
-@dataclass(frozen=True)
+@dataclass
 class NormalizedOptionTick:
     symbol: str
     instrument_key: str
@@ -50,13 +53,8 @@ class NormalizedOptionTick:
     price_change: float
     price_change_pct: float
     oi_change_pct: float
-    iv: Optional[float]
+    iv: float
     timestamp: float
-    sequence_no: Optional[int] = None
-    tte: float = 0.0                      # Exact calculated time-to-expiry in fractional years
-    broker_delta: Optional[float] = None
-    broker_theta: Optional[float] = None
-    broker_gamma: Optional[float] = None
-    broker_vega: Optional[float] = None
-    greek_source: str = "UNKNOWN"         # e.g., UPSTOX_CHAIN, UPSTOX_WS, INTERNAL_BS
-    data_source: str = "UNKNOWN"          # e.g., UPSTOX_REST, UPSTOX_FEED
+    sequence_no: int
+    tte: float
+    data_source: str
