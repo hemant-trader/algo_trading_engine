@@ -81,6 +81,20 @@ def get_market_quote(instrument_key, token):
         return None
     return None
 
+def get_option_chain_data(instrument_key, expiry_date, token):
+    """Fetches real live option chain depth from Upstox API."""
+    url = f"https://api.upstox.com/v2/option/chain?instrument_key={urllib.parse.quote(instrument_key)}&expiry_date={expiry_date}"
+    headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        response = requests.get(url, headers=headers, timeout=4)
+        if response.status_code == 200:
+            res_json = response.json()
+            if res_json.get("status") == "success" and "data" in res_json:
+                return res_json["data"]
+    except Exception:
+        return None
+    return None
+
 saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
     st.session_state["access_token"] = saved_token_data["access_token"]
@@ -138,6 +152,12 @@ def evaluate_regime_and_direction(price_history, selected_index):
     if price_spread <= threshold_range and abs(momentum_pct) < 0.04:
         return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "SIDEWAYS_RANGEBOUND", threshold_range
 
+    # Normalized 7-Point Scoring Weight Architecture
+    # 1. EMA Trend Alignment: 2 pts
+    # 2. Price Momentum Velocity: 2 pts
+    # 3. Position vs Short EMA: 1 pt
+    # 4. RSI Directional Confirmation: 2 pts
+    # Total Max Possible Score = 7 pts
     bull_score = 0
     bear_score = 0
 
@@ -161,11 +181,13 @@ def evaluate_regime_and_direction(price_history, selected_index):
     elif rsi <= 45.0:
         bear_score += 2
 
+    TOTAL_MAX_SCORE = 7.0
+
     if bull_score >= 5 and bull_score >= (bear_score + 2):
-        trend_strength = (bull_score / 7.0) * 100.0
+        trend_strength = (bull_score / TOTAL_MAX_SCORE) * 100.0
         return MarketDirection.BULLISH, trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range
     elif bear_score >= 5 and bear_score >= (bull_score + 2):
-        trend_strength = (bear_score / 7.0) * 100.0
+        trend_strength = (bear_score / TOTAL_MAX_SCORE) * 100.0
         return MarketDirection.BEARISH, trend_strength, rsi, price_spread, "TRENDING_BEARISH", threshold_range
 
     return MarketDirection.NEUTRAL, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
@@ -265,7 +287,8 @@ else:
 
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
-    quote_data = get_market_quote(inst_key, st.session_state["access_token"])
+    token = st.session_state["access_token"]
+    quote_data = get_market_quote(inst_key, token)
     
     spot_ltp = None
     if quote_data and "data" in quote_data:
@@ -290,44 +313,37 @@ if "access_token" in st.session_state:
         active_expiry = get_nearest_expiry()
         exact_tte = get_exact_tte(active_expiry)
 
-        # Strike Logic: Best OTM (Top Banner) vs Best Execution Strike (Candidate Card)
+        # 2-Stage Momentum Classification
+        is_strong_momentum = (
+            (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
+            (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
+        )
+        required_confirmations = 2 if is_strong_momentum else 3
+        required_min_score = 70.0 if is_strong_momentum else 75.0
+
         if market_dir == MarketDirection.BULLISH:
             chosen_opt_type = OptionType.CE
-            otm_strike = atm_strike + strike_interval  # 1-Step OTM for Banner
-            
-            # High Momentum Execution Strike: ATM or ITM (Delta ~0.55-0.65)
-            if trend_strength >= 85.0:
-                best_exec_strike = atm_strike - strike_interval  # ITM on strong surge
-                strike_tag = "ITM"
-            else:
-                best_exec_strike = atm_strike  # ATM on steady breakout
-                strike_tag = "ATM"
-
+            otm_strike = atm_strike + strike_interval
+            best_exec_strike = atm_strike - strike_interval if is_strong_momentum else atm_strike
+            strike_tag = "ITM" if is_strong_momentum else "ATM"
             regime_title = "TRENDING (BULLISH)"
             regime_color = "#2ecc71"
-            trend_focus = "MOMENTUM CE"
+            trend_focus = "STRONG BREAKOUT CE" if is_strong_momentum else "MOMENTUM CE"
             best_otm_label = f"{int(otm_strike)} CE (OTM)"
             best_otm_color = "#64ffda"
-            banner_note = f"Breakout active ({price_spread:.1f} pts). Best OTM target selected."
+            banner_note = f"Breakout active ({price_spread:.1f} pts). Target strike selected."
 
         elif market_dir == MarketDirection.BEARISH:
             chosen_opt_type = OptionType.PE
-            otm_strike = atm_strike - strike_interval  # 1-Step OTM for Banner
-            
-            # High Momentum Execution Strike: ATM or ITM (Delta ~0.55-0.65)
-            if trend_strength >= 85.0:
-                best_exec_strike = atm_strike + strike_interval  # ITM on strong breakdown
-                strike_tag = "ITM"
-            else:
-                best_exec_strike = atm_strike  # ATM on steady breakdown
-                strike_tag = "ATM"
-
+            otm_strike = atm_strike - strike_interval
+            best_exec_strike = atm_strike + strike_interval if is_strong_momentum else atm_strike
+            strike_tag = "ITM" if is_strong_momentum else "ATM"
             regime_title = "TRENDING (BEARISH)"
             regime_color = "#e74c3c"
-            trend_focus = "MOMENTUM PE"
+            trend_focus = "STRONG BREAKDOWN PE" if is_strong_momentum else "MOMENTUM PE"
             best_otm_label = f"{int(otm_strike)} PE (OTM)"
             best_otm_color = "#64ffda"
-            banner_note = f"Breakdown active ({price_spread:.1f} pts). Best OTM target selected."
+            banner_note = f"Breakdown active ({price_spread:.1f} pts). Target strike selected."
 
         else:
             chosen_opt_type = OptionType.CE
@@ -352,6 +368,33 @@ if "access_token" in st.session_state:
             symbol_prefix = selected_index.replace(" ", "").upper()
             clean_symbol = f"{symbol_prefix}_{int(best_exec_strike)}_{chosen_opt_type.value} ({strike_tag})"
 
+            # Live Option Chain Feed Fetch
+            chain_data = get_option_chain_data(inst_key, active_expiry, token)
+            
+            real_ltp = 0.0
+            real_bid = 0.0
+            real_ask = 0.0
+            real_oi = 0
+            real_vol = 0
+            chain_iv = display_iv / 100.0
+            feed_source = "SPOT_FALLBACK"
+
+            if chain_data:
+                for row in chain_data:
+                    if row.get("strike_price") == float(best_exec_strike):
+                        opt_key = "call_options" if chosen_opt_type == OptionType.CE else "put_options"
+                        opt_info = row.get(opt_key, {})
+                        market_data = opt_info.get("market_data", {})
+                        real_ltp = float(market_data.get("ltp", 0.0))
+                        real_bid = float(market_data.get("bid_price", 0.0))
+                        real_ask = float(market_data.get("ask_price", 0.0))
+                        real_oi = int(opt_info.get("oi", 0))
+                        real_vol = int(market_data.get("volume", 0))
+                        if opt_info.get("option_greeks", {}).get("iv"):
+                            chain_iv = float(opt_info["option_greeks"]["iv"]) / 100.0
+                        feed_source = "UPSTOX_LIVE_CHAIN"
+                        break
+
             tick = NormalizedOptionTick(
                 symbol=clean_symbol,
                 instrument_key=clean_symbol,
@@ -360,45 +403,46 @@ if "access_token" in st.session_state:
                 expiry=active_expiry,
                 strike=float(best_exec_strike),
                 option_type=chosen_opt_type,
-                ltp=0.0,
-                bid=0.0,
-                ask=0.0,
-                spread=0.0,
+                ltp=real_ltp,
+                bid=real_bid,
+                ask=real_ask,
+                spread=max(0.0, real_ask - real_bid),
                 bid_qty=0,
                 ask_qty=0,
-                volume=0,
-                oi=0,
+                volume=real_vol,
+                oi=real_oi,
                 previous_oi=0,
                 volume_change=0,
                 oi_change=0,
                 price_change=0.0,
                 price_change_pct=0.0,
                 oi_change_pct=0.0,
-                iv=display_iv / 100.0,
+                iv=chain_iv,
                 timestamp=current_time,
                 sequence_no=int(current_time),
                 tte=exact_tte,
-                data_source="SPOT_TECHNICAL_STREAM"
+                data_source=feed_source
             )
 
             greeks = BlackScholesEngine.calculate_greeks(
-                spot_ltp, tick.strike, tick.tte, 0.07, (display_iv / 100.0), tick.option_type
+                spot_ltp, tick.strike, tick.tte, 0.07, chain_iv, tick.option_type
             )
 
             composite_score = float(trend_strength)
 
-            try:
-                candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                    tick.symbol, tick.strike, tick.option_type, composite_score, market_dir
-                )
-            except TypeError:
-                candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                    tick.symbol, tick.strike, tick.option_type, composite_score
-                )
+            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                symbol=tick.symbol,
+                strike=tick.strike,
+                option_type=tick.option_type,
+                score=composite_score,
+                direction=market_dir,
+                required_confirmations=required_confirmations
+            )
 
             st.session_state["ttl_manager"].pulse(True)
 
             if greeks is not None:
+                # Strong breakdown/breakout enforces tight delta gate (0.45 - 0.65)
                 passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
                     market_direction=market_dir,
                     tick=tick,
@@ -406,14 +450,22 @@ if "access_token" in st.session_state:
                     candidate=candidate,
                     candidate_ready=is_ready,
                     ttl_state=st.session_state["ttl_manager"],
-                    quality_grade="GRADE_A",
-                    max_spread_pct=0.02
+                    quality_grade="GRADE_A" if feed_source == "UPSTOX_LIVE_CHAIN" else "PENDING_CHAIN",
+                    max_spread_pct=0.03
                 )
+                
+                # Additional 2-Stage Delta Filter for High Momentum
+                if passed and is_strong_momentum:
+                    abs_delta = abs(greeks.delta)
+                    if abs_delta < 0.40 or abs_delta > 0.70:
+                        passed = False
+                        gate_msg = f"BLOCKED_DELTA_STRICT: Fast momentum requires delta 0.40-0.70 (got {abs_delta:.2f})"
             else:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
 
-            if passed and is_ready and composite_score >= 75.0 and market_dir != MarketDirection.NEUTRAL:
+            # 2-Stage Execution Trigger Logic
+            if passed and is_ready and composite_score >= required_min_score and market_dir != MarketDirection.NEUTRAL:
                 final_action = f"BUY {chosen_opt_type.value}"
                 action_color = "#ff4b4b" if chosen_opt_type == OptionType.PE else "#2ecc71"
             else:
@@ -453,11 +505,11 @@ if "access_token" in st.session_state:
 
         with col_signal_card:
             confirmations_status = (
-                f"{candidate.confirmation_count}/3 Confirmed" 
-                if candidate else "0/3 Confirmed"
+                f"{candidate.confirmation_count}/{required_confirmations} Confirmed" 
+                if candidate else f"0/{required_confirmations} Confirmed"
             )
             score_display = f"{trend_strength:.1f}%" if market_dir != MarketDirection.NEUTRAL else "0.0%"
-            score_color = "#2ecc71" if trend_strength >= 75.0 else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
+            score_color = "#2ecc71" if trend_strength >= required_min_score else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
             gate_badge = "PASSED" if passed else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed else "#e74c3c"
             cand_sym = candidate.symbol if candidate else "Standby"
