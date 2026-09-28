@@ -136,7 +136,6 @@ saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
     st.session_state["access_token"] = saved_token_data["access_token"]
 
-# OAuth CSRF State Validation
 query_params = st.query_params
 auth_code = query_params.get("code", None)
 incoming_state = query_params.get("state", None)
@@ -399,7 +398,6 @@ if "access_token" in st.session_state:
             symbol_prefix = selected_index.replace(" ", "").upper()
             clean_symbol = f"{symbol_prefix}_{int(best_exec_strike)}_{chosen_opt_type.value} ({strike_tag})"
 
-            # Live Option Chain Feed Fetch
             chain_data = get_option_chain_data(inst_key, active_expiry, token)
             
             real_ltp = 0.0
@@ -543,11 +541,14 @@ if "access_token" in st.session_state:
             )
             st.markdown(regime_html, unsafe_allow_html=True)
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(label=f"{selected_index} Spot", value=f"₹{spot_ltp:,.2f}")
-            m2.metric(label="Calculated RSI (14)", value=f"{rsi_val:.1f}")
-            m3.metric(label="Option Chain IV", value=f"{chain_iv_val * 100:.2f}%")
-            m4.metric(label="Realized Volatility", value=f"{realized_vol:.2f}%")
+            # 2x2 Grid with wide columns so Spot Price never truncates
+            r1_col1, r1_col2 = st.columns([1.2, 1.0])
+            r1_col1.metric(label=f"{selected_index} Spot Price", value=f"₹{spot_ltp:,.2f}")
+            r1_col2.metric(label="Calculated RSI (14)", value=f"{rsi_val:.1f}")
+
+            r2_col1, r2_col2 = st.columns(2)
+            r2_col1.metric(label="Option Chain IV", value=f"{chain_iv_val * 100:.2f}%")
+            r2_col2.metric(label="Realized Volatility", value=f"{realized_vol:.2f}%")
 
             st.markdown("---")
             st.subheader(f"📈 Real Tick Feed: {selected_index}")
