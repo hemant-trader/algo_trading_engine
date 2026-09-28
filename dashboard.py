@@ -152,6 +152,112 @@ if auth_code and "access_token" not in st.session_state:
             st.session_state["access_token"] = res["access_token"]
             save_token_to_file(res)
 
+# Pre-resolve expiry for Sidebar widget
+current_token = st.session_state.get("access_token", None)
+curr_inst_key = INDEX_CONFIG[st.session_state["selected_index"]]["key"]
+sidebar_expiry = resolve_nearest_expiry(curr_inst_key, current_token) if current_token else "Loading..."
+
+# ================= SIDEBAR CONTROLS =================
+now_ist = datetime.datetime.now(IST)
+current_date_str = now_ist.strftime("%d %b %Y")
+current_time_str = now_ist.strftime("%I:%M:%S %p")
+today_iso = now_ist.strftime("%Y-%m-%d")
+
+# Clean compact expiry tag
+if sidebar_expiry == today_iso:
+    expiry_tag = '<span style="color:#ff4d4f; font-weight:700;">🔥 TODAY EXPIRY (0 DTE)</span>'
+else:
+    try:
+        exp_d = datetime.datetime.strptime(sidebar_expiry, "%Y-%m-%d").date()
+        exp_day_month = exp_d.strftime("%d/%m")
+        days_left = (exp_d - now_ist.date()).days
+        days_tag = f"({days_left}d)" if days_left > 0 else ""
+        expiry_tag = f'Expiry: <b style="color:#64ffda;">{exp_day_month}</b> {days_tag}'
+    except Exception:
+        expiry_tag = f'Expiry: <b style="color:#64ffda;">{sidebar_expiry}</b>'
+
+sidebar_top_badge = (
+    f'<div style="background-color:#111622; border:1px solid #1f293d; border-radius:8px; padding:8px 10px; margin-bottom:12px; font-size:11px;">'
+    f'<div style="display:flex; justify-content:space-between; color:#8b949e; font-family:monospace; margin-bottom:4px;">'
+    f'<span>📅 {current_date_str}</span><span>🕒 {current_time_str}</span>'
+    f'</div>'
+    f'<div style="border-top:1px solid #1f293d; padding-top:4px; text-align:center; color:#ccd6f6;">'
+    f'{expiry_tag}'
+    f'</div>'
+    f'</div>'
+)
+st.sidebar.markdown(sidebar_top_badge, unsafe_allow_html=True)
+
+st.sidebar.title("⚙️ System & Trade Control")
+st.sidebar.markdown("---")
+
+trade_mode = st.sidebar.radio(
+    "Execution State",
+    [
+        "🔴 OFF: Watch & Signal Mode (Paper Mode)",
+        "🟡 ARMED: Execution Simulation / Paper Monitor"
+    ],
+    index=0
+)
+
+st.sidebar.markdown("---")
+index_keys = list(INDEX_CONFIG.keys())
+saved_idx_pos = index_keys.index(st.session_state["selected_index"]) if st.session_state["selected_index"] in index_keys else 0
+
+selected_index = st.sidebar.selectbox(
+    "Select Index", 
+    index_keys, 
+    index=saved_idx_pos,
+    key="selected_index_dropdown"
+)
+
+if selected_index != st.session_state["selected_index"]:
+    st.session_state["selected_index"] = selected_index
+    st.session_state["price_history"] = []
+    st.session_state["candidate_tracker"].flush()
+    st.rerun()
+
+step_val = INDEX_CONFIG[selected_index]["step"]
+strike_offset = st.sidebar.number_input("Select Strike Price Offset", value=0, step=step_val)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🛡️ Safety Settings")
+max_loss = st.sidebar.number_input("Max Daily Loss (₹)", value=2000)
+target_pnl = st.sidebar.number_input("Daily Target PnL (₹)", value=4000)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🔑 Broker Authentication")
+if "access_token" not in st.session_state:
+    if "oauth_state" not in st.session_state:
+        st.session_state["oauth_state"] = secrets.token_urlsafe(32)
+    base_url = "https://api.upstox.com/v2/login/authorization/dialog"
+    params = {
+        "response_type": "code",
+        "client_id": UPSTOX_CONFIG["API_KEY"],
+        "redirect_uri": UPSTOX_CONFIG["REDIRECT_URI"],
+        "state": st.session_state["oauth_state"]
+    }
+    login_url = f"{base_url}?{urllib.parse.urlencode(params)}"
+    st.sidebar.link_button("Login with Upstox", login_url)
+    
+    manual_code = st.sidebar.text_input("Paste Authorization Code Here:")
+    if st.sidebar.button("Connect"):
+        if manual_code:
+            res = get_access_token(manual_code)
+            if "access_token" in res:
+                st.session_state["access_token"] = res["access_token"]
+                save_token_to_file(res)
+                st.rerun()
+else:
+    st.sidebar.success("✅ Upstox Session Active")
+    if st.sidebar.button("Logout / Reset Session"):
+        if os.path.exists(TOKEN_FILE):
+            os.remove(TOKEN_FILE)
+        del st.session_state["access_token"]
+        st.session_state["price_history"] = []
+        st.session_state["candidate_tracker"].flush()
+        st.rerun()
+
 # ================= TECHNICAL ENGINE =================
 def calculate_rsi(price_history, period=14):
     if len(price_history) < period + 1:
@@ -231,77 +337,6 @@ def evaluate_regime_and_direction(price_history, selected_index):
 
     return MarketDirection.NEUTRAL, 0, 0.0, rsi, price_spread, "CHOPPY_NO_TREND", threshold_range
 
-# ================= SIDEBAR CONTROLS =================
-st.sidebar.title("⚙️ System & Trade Control")
-st.sidebar.markdown("---")
-
-trade_mode = st.sidebar.radio(
-    "Execution State",
-    [
-        "🔴 OFF: Watch & Signal Mode (Paper Mode)",
-        "🟡 ARMED: Execution Simulation / Paper Monitor"
-    ],
-    index=0
-)
-
-st.sidebar.markdown("---")
-index_keys = list(INDEX_CONFIG.keys())
-saved_idx_pos = index_keys.index(st.session_state["selected_index"]) if st.session_state["selected_index"] in index_keys else 0
-
-selected_index = st.sidebar.selectbox(
-    "Select Index", 
-    index_keys, 
-    index=saved_idx_pos,
-    key="selected_index_dropdown"
-)
-
-if selected_index != st.session_state["selected_index"]:
-    st.session_state["selected_index"] = selected_index
-    st.session_state["price_history"] = []
-    st.session_state["candidate_tracker"].flush()
-    st.rerun()
-
-step_val = INDEX_CONFIG[selected_index]["step"]
-strike_offset = st.sidebar.number_input("Select Strike Price Offset", value=0, step=step_val)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ Safety Settings")
-max_loss = st.sidebar.number_input("Max Daily Loss (₹)", value=2000)
-target_pnl = st.sidebar.number_input("Daily Target PnL (₹)", value=4000)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔑 Broker Authentication")
-if "access_token" not in st.session_state:
-    if "oauth_state" not in st.session_state:
-        st.session_state["oauth_state"] = secrets.token_urlsafe(32)
-    base_url = "https://api.upstox.com/v2/login/authorization/dialog"
-    params = {
-        "response_type": "code",
-        "client_id": UPSTOX_CONFIG["API_KEY"],
-        "redirect_uri": UPSTOX_CONFIG["REDIRECT_URI"],
-        "state": st.session_state["oauth_state"]
-    }
-    login_url = f"{base_url}?{urllib.parse.urlencode(params)}"
-    st.sidebar.link_button("Login with Upstox", login_url)
-    
-    manual_code = st.sidebar.text_input("Paste Authorization Code Here:")
-    if st.sidebar.button("Connect"):
-        if manual_code:
-            res = get_access_token(manual_code)
-            if "access_token" in res:
-                st.session_state["access_token"] = res["access_token"]
-                save_token_to_file(res)
-                st.rerun()
-else:
-    st.sidebar.success("✅ Upstox Session Active")
-    if st.sidebar.button("Logout / Reset Session"):
-        if os.path.exists(TOKEN_FILE):
-            os.remove(TOKEN_FILE)
-        del st.session_state["access_token"]
-        st.session_state["price_history"] = []
-        st.session_state["candidate_tracker"].flush()
-        st.rerun()
-
 # ================= MAIN RUNTIME =================
 st.title("⚡ Hemant Algo Trading Engine")
 
@@ -323,47 +358,6 @@ if "access_token" in st.session_state:
             spot_ltp = float(quote_data["data"][key_name]["last_price"])
 
     active_expiry = resolve_nearest_expiry(inst_key, token)
-
-    # ================= PRESENT DATE, TIME & EXPIRY BADGE =================
-    now_ist = datetime.datetime.now(IST)
-    current_date_str = now_ist.strftime("%d %b %Y")
-    current_time_str = now_ist.strftime("%I:%M:%S %p")
-    today_iso = now_ist.strftime("%Y-%m-%d")
-
-    # Format expiry as Day/Month (DD/MM)
-    try:
-        exp_d = datetime.datetime.strptime(active_expiry, "%Y-%m-%d").date()
-        exp_day_month = exp_d.strftime("%d/%m")
-        days_left = (exp_d - now_ist.date()).days
-        days_str = f"({days_left} Days)" if days_left > 0 else ""
-    except Exception:
-        exp_day_month = active_expiry
-        days_str = ""
-
-    if active_expiry == today_iso:
-        expiry_badge_html = """
-        <span style="background-color: #e74c3c; color: #ffffff; padding: 5px 12px; border-radius: 6px; font-weight: bold; font-size: 12px; letter-spacing: 0.5px;">
-            🔥 TODAY EXPIRY (0 DTE)
-        </span>
-        """
-    else:
-        expiry_badge_html = f"""
-        <span style="background-color: #161f30; color: #64ffda; padding: 5px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; border: 1px solid #233554;">
-            📅 Active Expiry: <b style="color:#ffffff;">{exp_day_month}</b> {days_str}
-        </span>
-        """
-
-    time_window_html = f"""
-    <div style="display:flex; justify-content:space-between; align-items:center; background-color:#0d1117; padding:8px 16px; border-radius:8px; border:1px solid #30363d; margin-bottom:12px;">
-        <div style="color:#8b949e; font-size:13px; font-family:monospace;">
-            🕒 <b style="color:#f0f6fc;">{current_date_str}</b> | <span style="color:#58a6ff;">{current_time_str} IST</span>
-        </div>
-        <div>
-            {expiry_badge_html}
-        </div>
-    </div>
-    """
-    st.markdown(time_window_html, unsafe_allow_html=True)
 
     if spot_ltp is not None:
         st.session_state["price_history"].append(spot_ltp)
@@ -586,26 +580,26 @@ if "access_token" in st.session_state:
             st.markdown(regime_html, unsafe_allow_html=True)
 
             # Single-row compact 4-metric strip (Zero truncation, zero duplicate)
-            metrics_strip_html = f"""
-            <div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">
-                <div style="flex: 1.3; border-right: 1px solid #233554; padding-right: 8px;">
-                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">{selected_index} Spot</div>
-                    <div style="color:#ffffff; font-size:20px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>
-                </div>
-                <div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">
-                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">RSI (14)</div>
-                    <div style="color:#64ffda; font-size:20px; font-weight:700; margin-top:2px;">{rsi_val:.1f}</div>
-                </div>
-                <div style="flex: 1.0; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">
-                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Option IV</div>
-                    <div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{chain_iv_val * 100:.2f}%</div>
-                </div>
-                <div style="flex: 1.1; text-align:right; padding-left: 8px;">
-                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Realized Vol</div>
-                    <div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{realized_vol:.2f}%</div>
-                </div>
-            </div>
-            """
+            metrics_strip_html = (
+                f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
+                f'<div style="flex: 1.3; border-right: 1px solid #233554; padding-right: 8px;">'
+                f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">{selected_index} Spot</div>'
+                f'<div style="color:#ffffff; font-size:20px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>'
+                f'</div>'
+                f'<div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">'
+                f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">RSI (14)</div>'
+                f'<div style="color:#64ffda; font-size:20px; font-weight:700; margin-top:2px;">{rsi_val:.1f}</div>'
+                f'</div>'
+                f'<div style="flex: 1.0; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">'
+                f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Option IV</div>'
+                f'<div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{chain_iv_val * 100:.2f}%</div>'
+                f'</div>'
+                f'<div style="flex: 1.1; text-align:right; padding-left: 8px;">'
+                f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Realized Vol</div>'
+                f'<div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{realized_vol:.2f}%</div>'
+                f'</div>'
+                f'</div>'
+            )
             st.markdown(metrics_strip_html, unsafe_allow_html=True)
 
             st.markdown("---")
