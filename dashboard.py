@@ -136,6 +136,7 @@ saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
     st.session_state["access_token"] = saved_token_data["access_token"]
 
+# OAuth CSRF State Validation
 query_params = st.query_params
 auth_code = query_params.get("code", None)
 incoming_state = query_params.get("state", None)
@@ -398,6 +399,7 @@ if "access_token" in st.session_state:
             symbol_prefix = selected_index.replace(" ", "").upper()
             clean_symbol = f"{symbol_prefix}_{int(best_exec_strike)}_{chosen_opt_type.value} ({strike_tag})"
 
+            # Live Option Chain Feed Fetch
             chain_data = get_option_chain_data(inst_key, active_expiry, token)
             
             real_ltp = 0.0
@@ -541,14 +543,28 @@ if "access_token" in st.session_state:
             )
             st.markdown(regime_html, unsafe_allow_html=True)
 
-            # 2x2 Grid with wide columns so Spot Price never truncates
-            r1_col1, r1_col2 = st.columns([1.2, 1.0])
-            r1_col1.metric(label=f"{selected_index} Spot Price", value=f"₹{spot_ltp:,.2f}")
-            r1_col2.metric(label="Calculated RSI (14)", value=f"{rsi_val:.1f}")
-
-            r2_col1, r2_col2 = st.columns(2)
-            r2_col1.metric(label="Option Chain IV", value=f"{chain_iv_val * 100:.2f}%")
-            r2_col2.metric(label="Realized Volatility", value=f"{realized_vol:.2f}%")
+            # Single-row compact 4-metric strip (Zero truncation, zero duplicate)
+            metrics_strip_html = f"""
+            <div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">
+                <div style="flex: 1.3; border-right: 1px solid #233554; padding-right: 8px;">
+                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">{selected_index} Spot</div>
+                    <div style="color:#ffffff; font-size:20px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>
+                </div>
+                <div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">
+                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">RSI (14)</div>
+                    <div style="color:#64ffda; font-size:20px; font-weight:700; margin-top:2px;">{rsi_val:.1f}</div>
+                </div>
+                <div style="flex: 1.0; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">
+                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Option IV</div>
+                    <div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{chain_iv_val * 100:.2f}%</div>
+                </div>
+                <div style="flex: 1.1; text-align:right; padding-left: 8px;">
+                    <div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Realized Vol</div>
+                    <div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{realized_vol:.2f}%</div>
+                </div>
+            </div>
+            """
+            st.markdown(metrics_strip_html, unsafe_allow_html=True)
 
             st.markdown("---")
             st.subheader(f"📈 Real Tick Feed: {selected_index}")
