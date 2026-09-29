@@ -23,6 +23,11 @@ st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 TOKEN_FILE = "access_token.json"
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
+# Network Latency & Polling Constants
+POLL_INTERVAL = 5.0
+JITTER_BUFFER = 3.0
+INITIAL_TTL_ESTIMATE = max(8.0, POLL_INTERVAL + JITTER_BUFFER + 2.0)
+
 INDEX_CONFIG = {
     "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50, "sideways_range": 25.0},
     "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "strike_mult": 100, "sideways_range": 60.0},
@@ -38,7 +43,7 @@ if "tick_guard" not in st.session_state:
 if "candidate_tracker" not in st.session_state:
     st.session_state["candidate_tracker"] = CandidateHysteresisTracker()
 if "ttl_manager" not in st.session_state:
-    st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=5)
+    st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=int(INITIAL_TTL_ESTIMATE))
 if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
 
@@ -163,7 +168,6 @@ current_date_str = now_ist.strftime("%d %b %Y")
 current_time_str = now_ist.strftime("%I:%M:%S %p")
 today_iso = now_ist.strftime("%Y-%m-%d")
 
-# Clean compact expiry tag
 if sidebar_expiry == today_iso:
     expiry_tag = '<span style="color:#ff4d4f; font-weight:700;">🔥 TODAY EXPIRY (0 DTE)</span>'
 else:
@@ -349,8 +353,12 @@ else:
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
     token = st.session_state["access_token"]
-    quote_data = get_market_quote(inst_key, token)
     
+    # 1. API Call with Precise Network Latency Measurement
+    t_req_start = time.time()
+    quote_data = get_market_quote(inst_key, token)
+    api_latency = max(0.1, time.time() - t_req_start)
+
     spot_ltp = None
     if quote_data and "data" in quote_data:
         key_name = inst_key.replace("|", ":")
@@ -360,6 +368,11 @@ if "access_token" in st.session_state:
     active_expiry = resolve_nearest_expiry(inst_key, token)
 
     if spot_ltp is not None:
+        # POINT 1 & 2: True Ingress Pulse + Adaptive TTL (Float Precision Preserved)
+        dynamic_ttl = max(8.0, POLL_INTERVAL + api_latency + JITTER_BUFFER)
+        st.session_state["ttl_manager"].max_ttl = int(np.ceil(dynamic_ttl))
+        st.session_state["ttl_manager"].pulse(True)
+
         st.session_state["price_history"].append(spot_ltp)
         if len(st.session_state["price_history"]) > 50:
             st.session_state["price_history"].pop(0)
@@ -379,7 +392,7 @@ if "access_token" in st.session_state:
         
         exact_tte = calculate_precise_tte(active_expiry)
 
-        # 2-Stage Confirmation
+        # 2-Stage Confirmation Configuration
         is_strong_momentum = (
             (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
             (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
@@ -448,6 +461,7 @@ if "access_token" in st.session_state:
             real_vol = 0
             upstox_delta = None
             feed_source = "SPOT_FALLBACK"
+            real_broker_key = clean_symbol
 
             if chain_data:
                 for row in chain_data:
@@ -457,6 +471,10 @@ if "access_token" in st.session_state:
                         market_data = opt_info.get("market_data", {})
                         greeks_data = opt_info.get("option_greeks", {})
                         
+                        # Real Broker Instrument Key Extraction
+                        if opt_info.get("instrument_key"):
+                            real_broker_key = opt_info["instrument_key"]
+
                         real_ltp = float(market_data.get("ltp", 0.0))
                         real_bid = float(market_data.get("bid_price", 0.0))
                         real_ask = float(market_data.get("ask_price", 0.0))
@@ -476,9 +494,10 @@ if "access_token" in st.session_state:
                         feed_source = "UPSTOX_LIVE_CHAIN"
                         break
 
+            # POINT 3: Real Broker Key passed to NormalizedOptionTick
             tick = NormalizedOptionTick(
                 symbol=clean_symbol,
-                instrument_key=clean_symbol,
+                instrument_key=real_broker_key,
                 underlying=selected_index,
                 underlying_spot=spot_ltp,
                 expiry=active_expiry,
@@ -499,7 +518,7 @@ if "access_token" in st.session_state:
                 price_change_pct=0.0,
                 oi_change_pct=0.0,
                 iv=chain_iv_val,
-                timestamp=current_time,
+                timestamp=time.time(),
                 sequence_no=current_seq,
                 tte=exact_tte,
                 data_source=feed_source
@@ -520,9 +539,10 @@ if "access_token" in st.session_state:
                 required_confirmations=required_confirmations
             )
 
-            st.session_state["ttl_manager"].pulse(True)
+            # NOTE: Artificial duplicate pulse removed. Verified strictly from ingress.
 
             if bs_greeks is not None:
+                # Primary Zero-Trust Safety Gate Evaluation
                 passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
                     market_direction=market_dir,
                     tick=tick,
@@ -531,7 +551,9 @@ if "access_token" in st.session_state:
                     candidate_ready=is_ready,
                     ttl_state=st.session_state["ttl_manager"],
                     quality_grade="GRADE_A" if feed_source == "UPSTOX_LIVE_CHAIN" else "PENDING_CHAIN",
-                    max_spread_pct=0.03
+                    max_spread_pct=0.03,
+                    min_delta=0.45,
+                    max_delta=0.65
                 )
                 
                 # Dual-Greeks Cross Validation
@@ -540,13 +562,6 @@ if "access_token" in st.session_state:
                     if delta_diff > 0.08:
                         passed = False
                         gate_msg = f"BLOCKED_GREEKS_DISCREPANCY: Broker vs BS Delta skew ({delta_diff:.2f})"
-
-                # Strict Delta Bounds: 0.45 <= |delta| <= 0.65
-                if passed and is_strong_momentum:
-                    abs_delta = abs(bs_greeks.delta)
-                    if abs_delta < 0.45 or abs_delta > 0.65:
-                        passed = False
-                        gate_msg = f"BLOCKED_DELTA_BOUNDS: Fast momentum requires 0.45-0.65 (got {abs_delta:.2f})"
             else:
                 passed = False
                 gate_msg = "BLOCKED: Greeks calculation failed"
@@ -579,7 +594,6 @@ if "access_token" in st.session_state:
             )
             st.markdown(regime_html, unsafe_allow_html=True)
 
-            # Single-row compact 4-metric strip (Zero truncation, zero duplicate)
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
                 f'<div style="flex: 1.3; border-right: 1px solid #233554; padding-right: 8px;">'
@@ -643,7 +657,7 @@ if "access_token" in st.session_state:
     else:
         st.warning(f"Connecting to Upstox market feed for {selected_index}...")
 
-    time.sleep(5)
+    time.sleep(POLL_INTERVAL)
     st.rerun()
 
 else:
