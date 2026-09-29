@@ -16,3 +16,7 @@ class PulseTTLStateMachine:
 
     def is_alive(self) -> bool:
         return self.current_ttl > 0
+
+    # Safety-Gate Contract Compatibility
+    def is_valid(self) -> bool:
+        return self.is_alive()
