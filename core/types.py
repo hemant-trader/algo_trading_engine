@@ -47,13 +47,13 @@ class NormalizedOptionTick:
     ask_qty: int
     volume: int
     oi: int
-    previous_oi: int
-    volume_change: int
-    oi_change: int
-    price_change: float
-    price_change_pct: float
-    oi_change_pct: float
-    iv: float
+    previous_oi: Optional[int]
+    volume_change: Optional[int]
+    oi_change: Optional[int]
+    price_change: Optional[float]
+    price_change_pct: Optional[float]
+    oi_change_pct: Optional[float]
+    iv: float  # Decimal IV (0.18 = 18%)
     timestamp: float
     sequence_no: int
     tte: float
