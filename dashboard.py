@@ -15,8 +15,13 @@ from core.types import MarketDirection, OptionType, NormalizedOptionTick
 from core.black_scholes import BlackScholesEngine
 from processing.tick_guard import TickGuardEngine
 from processing.candidate_tracker import CandidateHysteresisTracker
+from processing.candidate_scanner import MultiFactorOptionScanner
 from engine.pulse_ttl import PulseTTLStateMachine
 from engine.safety_gate import ZeroTrustFinalSafetyGate
+from engine.expiry_manager import FailClosedExpiryManager
+from engine.contract_verifier import ContractIdentityAuthority
+from engine.live_execution_quote_provider import LiveExecutionQuoteProvider
+from engine.telemetry_logger import HeadlessObservationLogger
 
 st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 
@@ -34,6 +39,7 @@ INDEX_CONFIG = {
     "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "strike_mult": 100, "sideways_range": 80.0},
 }
 
+# Session State Initializations
 if "selected_index" not in st.session_state:
     st.session_state["selected_index"] = "NIFTY 50"
 if "price_history" not in st.session_state:
@@ -41,11 +47,21 @@ if "price_history" not in st.session_state:
 if "tick_guard" not in st.session_state:
     st.session_state["tick_guard"] = TickGuardEngine()
 if "candidate_tracker" not in st.session_state:
-    st.session_state["candidate_tracker"] = CandidateHysteresisTracker()
+    st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_delta=5.0, flip_cooldown_seconds=12.0)
+if "candidate_scanner" not in st.session_state:
+    st.session_state["candidate_scanner"] = MultiFactorOptionScanner()
+if "expiry_manager" not in st.session_state:
+    st.session_state["expiry_manager"] = FailClosedExpiryManager()
+if "quote_provider" not in st.session_state:
+    st.session_state["quote_provider"] = LiveExecutionQuoteProvider(max_stale_seconds=3.5, max_clock_skew_seconds=0.5)
+if "telemetry_logger" not in st.session_state:
+    st.session_state["telemetry_logger"] = HeadlessObservationLogger(log_dir="logs")
 if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=int(INITIAL_TTL_ESTIMATE))
 if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
+if "last_bar_minute" not in st.session_state:
+    st.session_state["last_bar_minute"] = None
 
 def save_token_to_file(token_data):
     with open(TOKEN_FILE, "w") as f:
@@ -100,31 +116,6 @@ def get_option_chain_data(instrument_key, expiry_date, token):
         return None
     return None
 
-def get_option_contracts(instrument_key, token):
-    url = f"https://api.upstox.com/v2/option/contract?instrument_key={urllib.parse.quote(instrument_key)}"
-    headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
-    try:
-        response = requests.get(url, headers=headers, timeout=4)
-        if response.status_code == 200:
-            res = response.json()
-            if res.get("status") == "success" and "data" in res:
-                return res["data"]
-    except Exception:
-        return None
-    return None
-
-def resolve_nearest_expiry(instrument_key, token):
-    contracts = get_option_contracts(instrument_key, token)
-    if contracts:
-        today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        valid_expiries = sorted([c["expiry"] for c in contracts if c.get("expiry") and c["expiry"] >= today_str])
-        if valid_expiries:
-            return valid_expiries[0]
-    
-    today = datetime.date.today()
-    days_ahead = (3 - today.weekday()) % 7
-    return (today + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-
 def calculate_precise_tte(expiry_str):
     try:
         now_ist = datetime.datetime.now(IST)
@@ -157,10 +148,20 @@ if auth_code and "access_token" not in st.session_state:
             st.session_state["access_token"] = res["access_token"]
             save_token_to_file(res)
 
-# Pre-resolve expiry for Sidebar widget
+# Current token resolution
 current_token = st.session_state.get("access_token", None)
 curr_inst_key = INDEX_CONFIG[st.session_state["selected_index"]]["key"]
-sidebar_expiry = resolve_nearest_expiry(curr_inst_key, current_token) if current_token else "Loading..."
+
+# Fail-closed expiry resolution
+active_expiry = None
+active_contracts = []
+expiry_rotated = False
+expiry_status = "TOKEN_MISSING"
+
+if current_token:
+    active_expiry, active_contracts, expiry_rotated, expiry_status = st.session_state["expiry_manager"].get_active_expiry_and_contracts(
+        curr_inst_key, current_token
+    )
 
 # ================= SIDEBAR CONTROLS =================
 now_ist = datetime.datetime.now(IST)
@@ -168,17 +169,19 @@ current_date_str = now_ist.strftime("%d %b %Y")
 current_time_str = now_ist.strftime("%I:%M:%S %p")
 today_iso = now_ist.strftime("%Y-%m-%d")
 
-if sidebar_expiry == today_iso:
+if active_expiry == today_iso:
     expiry_tag = '<span style="color:#ff4d4f; font-weight:700;">🔥 TODAY EXPIRY (0 DTE)</span>'
-else:
+elif active_expiry:
     try:
-        exp_d = datetime.datetime.strptime(sidebar_expiry, "%Y-%m-%d").date()
+        exp_d = datetime.datetime.strptime(active_expiry, "%Y-%m-%d").date()
         exp_day_month = exp_d.strftime("%d/%m")
         days_left = (exp_d - now_ist.date()).days
         days_tag = f"({days_left}d)" if days_left > 0 else ""
         expiry_tag = f'Expiry: <b style="color:#64ffda;">{exp_day_month}</b> {days_tag}'
     except Exception:
-        expiry_tag = f'Expiry: <b style="color:#64ffda;">{sidebar_expiry}</b>'
+        expiry_tag = f'Expiry: <b style="color:#64ffda;">{active_expiry}</b>'
+else:
+    expiry_tag = f'<span style="color:#ff4d4f;">⚠️ {expiry_status}</span>'
 
 sidebar_top_badge = (
     f'<div style="background-color:#111622; border:1px solid #1f293d; border-radius:8px; padding:8px 10px; margin-bottom:12px; font-size:11px;">'
@@ -219,13 +222,11 @@ if selected_index != st.session_state["selected_index"]:
     st.session_state["selected_index"] = selected_index
     st.session_state["price_history"] = []
     st.session_state["candidate_tracker"].flush()
+    st.session_state["expiry_manager"].flush_cache()
     st.rerun()
 
-step_val = INDEX_CONFIG[selected_index]["step"]
-strike_offset = st.sidebar.number_input("Select Strike Price Offset", value=0, step=step_val)
-
 st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️ Safety Settings")
+st.sidebar.subheader("🛡️️ Safety Settings")
 max_loss = st.sidebar.number_input("Max Daily Loss (₹)", value=2000)
 target_pnl = st.sidebar.number_input("Daily Target PnL (₹)", value=4000)
 
@@ -260,6 +261,7 @@ else:
         del st.session_state["access_token"]
         st.session_state["price_history"] = []
         st.session_state["candidate_tracker"].flush()
+        st.session_state["expiry_manager"].flush_cache()
         st.rerun()
 
 # ================= TECHNICAL ENGINE =================
@@ -365,10 +367,7 @@ if "access_token" in st.session_state:
         if key_name in quote_data["data"]:
             spot_ltp = float(quote_data["data"][key_name]["last_price"])
 
-    active_expiry = resolve_nearest_expiry(inst_key, token)
-
     if spot_ltp is not None:
-        # POINT 1 & 2: True Ingress Pulse + Adaptive TTL (Float Precision Preserved)
         dynamic_ttl = max(8.0, POLL_INTERVAL + api_latency + JITTER_BUFFER)
         st.session_state["ttl_manager"].max_ttl = int(np.ceil(dynamic_ttl))
         st.session_state["ttl_manager"].pulse(True)
@@ -386,11 +385,17 @@ if "access_token" in st.session_state:
 
         realized_vol = calculate_realized_volatility(st.session_state["price_history"])
 
-        strike_interval = INDEX_CONFIG[selected_index]["strike_mult"]
-        atm_strike = round(spot_ltp / strike_interval) * strike_interval + strike_offset
-        current_time = time.time()
+        # 5M Closed Bar Detection & Idempotency
+        now_time = datetime.datetime.now(IST)
+        current_bar_min = now_time.minute - (now_time.minute % 5)
+        bar_identifier = f"{now_time.strftime('%Y-%m-%d %H')}:{current_bar_min:02d}:00"
         
-        exact_tte = calculate_precise_tte(active_expiry)
+        is_new_closed_bar = False
+        if st.session_state["last_bar_minute"] != current_bar_min:
+            # Startup partial drop: only trigger after first known boundary
+            if st.session_state["last_bar_minute"] is not None:
+                is_new_closed_bar = True
+            st.session_state["last_bar_minute"] = current_bar_min
 
         # 2-Stage Confirmation Configuration
         is_strong_momentum = (
@@ -398,187 +403,174 @@ if "access_token" in st.session_state:
             (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
         )
         required_confirmations = 2 if is_strong_momentum else 3
-        required_min_score = 70.0 if is_strong_momentum else 75.0
 
-        if market_dir == MarketDirection.BULLISH:
-            chosen_opt_type = OptionType.CE
-            otm_strike = atm_strike + strike_interval
-            best_exec_strike = atm_strike - strike_interval if is_strong_momentum else atm_strike
-            strike_tag = "ITM" if is_strong_momentum else "ATM"
-            regime_title = "TRENDING (BULLISH)"
-            regime_color = "#2ecc71"
-            trend_focus = "STRONG BREAKOUT CE" if is_strong_momentum else "MOMENTUM CE"
-            best_otm_label = f"{int(otm_strike)} CE (OTM)"
-            best_otm_color = "#64ffda"
-            banner_note = f"Breakout active ({price_spread:.1f} pts). Target strike selected."
-
-        elif market_dir == MarketDirection.BEARISH:
-            chosen_opt_type = OptionType.PE
-            otm_strike = atm_strike - strike_interval
-            best_exec_strike = atm_strike + strike_interval if is_strong_momentum else atm_strike
-            strike_tag = "ITM" if is_strong_momentum else "ATM"
-            regime_title = "TRENDING (BEARISH)"
-            regime_color = "#e74c3c"
-            trend_focus = "STRONG BREAKDOWN PE" if is_strong_momentum else "MOMENTUM PE"
-            best_otm_label = f"{int(otm_strike)} PE (OTM)"
-            best_otm_color = "#64ffda"
-            banner_note = f"Breakdown active ({price_spread:.1f} pts). Target strike selected."
-
-        else:
-            chosen_opt_type = OptionType.CE
-            otm_strike = atm_strike
-            best_exec_strike = atm_strike
-            strike_tag = "ATM"
-            regime_title = "SIDEWAYS / RANGEBOUND"
-            regime_color = "#e67e22"
-            trend_focus = "NEUTRAL / NO CLEAR TREND"
-            best_otm_label = "WAIT / AVOID OTM"
-            best_otm_color = "#8892b0"
-            banner_note = f"Narrow consolidation ({price_spread:.1f} pts vs {spread_thresh} threshold). High theta decay risk."
-
-        candidate = None
+        # State Variables
+        best_candidate = None
+        scan_diag = {}
+        candidate_state = None
         is_ready = False
-        passed = False
-        gate_msg = "NEUTRAL_REGIME_STANDBY"
+        passed_gate = False
+        id_msg = "NOT_EVALUATED"
+        gate_msg = "STANDBY"
         final_action = "NO TRADE"
         action_color = "#f1c40f"
-        chain_iv_val = realized_vol / 100.0
+        live_quote = None
 
-        if market_dir != MarketDirection.NEUTRAL:
-            symbol_prefix = selected_index.replace(" ", "").upper()
-            clean_symbol = f"{symbol_prefix}_{int(best_exec_strike)}_{chosen_opt_type.value} ({strike_tag})"
-
-            # Live Option Chain Feed Fetch
-            chain_data = get_option_chain_data(inst_key, active_expiry, token)
-            
-            real_ltp = 0.0
-            real_bid = 0.0
-            real_ask = 0.0
-            real_bid_qty = 0
-            real_ask_qty = 0
-            real_oi = 0
-            real_prev_oi = 0
-            real_vol = 0
-            upstox_delta = None
-            feed_source = "SPOT_FALLBACK"
-            real_broker_key = clean_symbol
-
-            if chain_data:
-                for row in chain_data:
-                    if row.get("strike_price") == float(best_exec_strike):
-                        opt_key = "call_options" if chosen_opt_type == OptionType.CE else "put_options"
-                        opt_info = row.get(opt_key, {})
-                        market_data = opt_info.get("market_data", {})
-                        greeks_data = opt_info.get("option_greeks", {})
-                        
-                        # Real Broker Instrument Key Extraction
-                        if opt_info.get("instrument_key"):
-                            real_broker_key = opt_info["instrument_key"]
-
-                        real_ltp = float(market_data.get("ltp", 0.0))
-                        real_bid = float(market_data.get("bid_price", 0.0))
-                        real_ask = float(market_data.get("ask_price", 0.0))
-                        real_bid_qty = int(market_data.get("bid_qty", 0))
-                        real_ask_qty = int(market_data.get("ask_qty", 0))
-                        real_oi = int(market_data.get("oi", 0))
-                        real_prev_oi = int(market_data.get("prev_oi", 0))
-                        real_vol = int(market_data.get("volume", 0))
-                        
-                        raw_iv = greeks_data.get("iv", 0.0)
-                        if raw_iv and raw_iv > 0:
-                            chain_iv_val = (raw_iv / 100.0) if raw_iv > 1.5 else raw_iv
-                        
-                        if greeks_data.get("delta") is not None:
-                            upstox_delta = float(greeks_data["delta"])
-
-                        feed_source = "UPSTOX_LIVE_CHAIN"
-                        break
-
-            # POINT 3: Real Broker Key passed to NormalizedOptionTick
-            tick = NormalizedOptionTick(
-                symbol=clean_symbol,
-                instrument_key=real_broker_key,
-                underlying=selected_index,
-                underlying_spot=spot_ltp,
-                expiry=active_expiry,
-                strike=float(best_exec_strike),
-                option_type=chosen_opt_type,
-                ltp=real_ltp,
-                bid=real_bid,
-                ask=real_ask,
-                spread=max(0.0, real_ask - real_bid),
-                bid_qty=real_bid_qty,
-                ask_qty=real_ask_qty,
-                volume=real_vol,
-                oi=real_oi,
-                previous_oi=real_prev_oi,
-                volume_change=0,
-                oi_change=real_oi - real_prev_oi,
-                price_change=0.0,
-                price_change_pct=0.0,
-                oi_change_pct=0.0,
-                iv=chain_iv_val,
-                timestamp=time.time(),
-                sequence_no=current_seq,
-                tte=exact_tte,
-                data_source=feed_source
-            )
-
-            bs_greeks = BlackScholesEngine.calculate_greeks(
-                spot_ltp, tick.strike, tick.tte, 0.07, chain_iv_val, tick.option_type
-            )
-
-            composite_score = float(trend_strength)
-
-            candidate, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                symbol=tick.symbol,
-                strike=tick.strike,
-                option_type=tick.option_type,
-                score=composite_score,
-                direction=market_dir,
-                required_confirmations=required_confirmations
-            )
-
-            # NOTE: Artificial duplicate pulse removed. Verified strictly from ingress.
-
-            if bs_greeks is not None:
-                # Primary Zero-Trust Safety Gate Evaluation
-                passed, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
-                    market_direction=market_dir,
-                    tick=tick,
-                    greeks=bs_greeks,
-                    candidate=candidate,
-                    candidate_ready=is_ready,
-                    ttl_state=st.session_state["ttl_manager"],
-                    quality_grade="GRADE_A" if feed_source == "UPSTOX_LIVE_CHAIN" else "PENDING_CHAIN",
-                    max_spread_pct=0.03,
-                    min_delta=0.45,
-                    max_delta=0.65
-                )
-                
-                # Dual-Greeks Cross Validation
-                if passed and upstox_delta is not None:
-                    delta_diff = abs(abs(upstox_delta) - abs(bs_greeks.delta))
-                    if delta_diff > 0.08:
-                        passed = False
-                        gate_msg = f"BLOCKED_GREEKS_DISCREPANCY: Broker vs BS Delta skew ({delta_diff:.2f})"
-            else:
-                passed = False
-                gate_msg = "BLOCKED: Greeks calculation failed"
-
-            if passed and is_ready and composite_score >= required_min_score and market_dir != MarketDirection.NEUTRAL:
-                final_action = f"BUY {chosen_opt_type.value}"
-                action_color = "#ff4b4b" if chosen_opt_type == OptionType.PE else "#2ecc71"
-            else:
-                final_action = "NO TRADE"
-                action_color = "#f1c40f"
-        else:
+        # -------------------------------------------------------------
+        # STRICT FAIL-CLOSED EXECUTION PIPELINE
+        # -------------------------------------------------------------
+        if active_expiry is None:
             st.session_state["candidate_tracker"].flush()
+            final_action = "NO TRADE"
+            gate_msg = f"BLOCKED_EXPIRY: {expiry_status}"
+
+        elif expiry_rotated:
+            st.session_state["candidate_tracker"].flush()
+            final_action = "NO TRADE"
+            gate_msg = f"EXPIRY_ROTATED: Transition cycle skipped for {active_expiry}"
+
+        elif market_dir == MarketDirection.NEUTRAL:
+            st.session_state["candidate_tracker"].flush()
+            final_action = "NO TRADE"
+            gate_msg = "MARKET_REGIME_NEUTRAL"
+
+        else:
+            # 1. Fetch Option Chain Snapshot
+            chain_data = get_option_chain_data(inst_key, active_expiry, token)
+            if not chain_data:
+                gate_msg = "BLOCKED_CHAIN_API_EMPTY"
+            else:
+                # 2. Scanner: Exact 1 Winner with Finite Math & Explicit Decimal IV
+                best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
+                    chain_data=chain_data,
+                    direction=market_dir,
+                    trend_score=trend_strength
+                )
+
+                if best_candidate is None:
+                    gate_msg = "BLOCKED_SCANNER: 0 candidates cleared hard bounds"
+                else:
+                    cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+
+                    # 3. Tracker: Single Call with Closed-Bar Idempotency
+                    candidate_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                        symbol=cand_sym,
+                        strike=best_candidate["strike"],
+                        option_type=best_candidate["option_type"],
+                        score=best_candidate["score"],
+                        direction=market_dir,
+                        bar_timestamp=bar_identifier,
+                        is_new_closed_bar=is_new_closed_bar,
+                        required_confirmations=required_confirmations
+                    )
+
+                    if not is_ready:
+                        gate_msg = f"CONFIRMATION_PENDING ({candidate_state.confirmation_count if candidate_state else 0}/{required_confirmations})"
+                    else:
+                        # 4. 5-Point Immutable Contract Authority Match
+                        id_ok, id_msg = ContractIdentityAuthority.verify_against_broker_universe(
+                            instrument_key=best_candidate["instrument_key"],
+                            expected_underlying_key=inst_key,
+                            expected_strike=best_candidate["strike"],
+                            expected_type=best_candidate["option_type"],
+                            expected_expiry=active_expiry,
+                            active_contracts=active_contracts
+                        )
+
+                        if not id_ok:
+                            final_action = "NO TRADE"
+                            gate_msg = f"BLOCKED_IDENTITY: {id_msg}"
+                        else:
+                            # 5. Fresh Execution Quote Snapshot
+                            exact_tte = calculate_precise_tte(active_expiry)
+                            live_quote, quote_status = st.session_state["quote_provider"].fetch_execution_quote(
+                                instrument_key=best_candidate["instrument_key"],
+                                symbol=cand_sym,
+                                underlying=selected_index,
+                                underlying_spot=spot_ltp,
+                                expiry=active_expiry,
+                                strike=best_candidate["strike"],
+                                option_type=best_candidate["option_type"],
+                                token=token,
+                                tte=exact_tte,
+                                seq_no=current_seq,
+                                iv_decimal=best_candidate["iv_decimal"]
+                            )
+
+                            if live_quote is None:
+                                gate_msg = f"BLOCKED_QUOTE: {quote_status}"
+                            else:
+                                # 6. Black-Scholes Greeks Engine
+                                bs_greeks = BlackScholesEngine.calculate_greeks(
+                                    spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
+                                )
+
+                                # 7. Authoritative Zero-Trust Final Safety Gate
+                                passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
+                                    market_direction=market_dir,
+                                    tick=live_quote,
+                                    greeks=bs_greeks,
+                                    candidate=candidate_state,
+                                    candidate_ready=is_ready,
+                                    ttl_state=st.session_state["ttl_manager"],
+                                    quality_grade="GRADE_A",
+                                    max_spread_pct=0.03,
+                                    min_delta=0.45,
+                                    max_delta=0.65
+                                )
+
+                                if passed_gate:
+                                    final_action = f"BUY {best_candidate['option_type'].value}"
+                                    action_color = "#ff4b4b" if best_candidate["option_type"] == OptionType.PE else "#2ecc71"
+                                else:
+                                    final_action = "NO TRADE"
+                                    action_color = "#f1c40f"
+
+        # -------------------------------------------------------------
+        # HEADLESS OBSERVATION TELEMETRY (Read-Only Observer)
+        # -------------------------------------------------------------
+        if is_new_closed_bar:
+            quote_age_ms = None
+            if live_quote is not None:
+                quote_age_ms = (time.time() - live_quote.timestamp) * 1000.0
+
+            hypothetical_fill = live_quote.ask if (passed_gate and live_quote is not None) else None
+            tracker_inst = st.session_state["candidate_tracker"]
+
+            st.session_state["telemetry_logger"].record_bar_event(
+                bar_timestamp=bar_identifier,
+                sequence_no=current_seq,
+                underlying=selected_index,
+                spot_ltp=spot_ltp,
+                market_dir=market_dir.value if hasattr(market_dir, "value") else str(market_dir),
+                trend_score=trend_strength,
+                rsi_14=rsi_val,
+                price_spread=price_spread,
+                expiry=active_expiry,
+                expiry_rotated=expiry_rotated,
+                winner_candidate=best_candidate,
+                scan_diagnostics=scan_diag,
+                active_candidate=tracker_inst.active_candidate,
+                pending_candidate=tracker_inst.pending_candidate,
+                is_ready=is_ready,
+                contract_identity_status=id_msg,
+                live_quote_age_ms=quote_age_ms,
+                gate_status="PASSED" if passed_gate else "BLOCKED",
+                gate_reason=gate_msg,
+                final_action=final_action,
+                hypothetical_fill_ask_price=hypothetical_fill,
+                time_to_fill_ms=None
+            )
 
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
 
         with col_metric:
+            regime_title = f"TRENDING ({market_dir.value})" if market_dir != MarketDirection.NEUTRAL else "SIDEWAYS / CHOPPY"
+            regime_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else ("#e74c3c" if market_dir == MarketDirection.BEARISH else "#e67e22")
+            trend_focus = f"MOMENTUM {market_dir.value}" if market_dir != MarketDirection.NEUTRAL else "STANDBY / AVOID CHOP"
+            best_opt_display = best_candidate["symbol"] if best_candidate else "NONE"
+
             regime_html = (
                 f'<div style="background-color:#161f30; padding:12px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">'
                 f'<div style="display:flex; justify-content:space-between; align-items:center;">'
@@ -586,13 +578,15 @@ if "access_token" in st.session_state:
                 f'<div style="color:{regime_color}; font-size:14px; font-weight:bold; margin-top:2px;">⏳ {regime_title}</div></div>'
                 f'<div style="text-align:center;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">TREND FOCUS</span>'
                 f'<div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus}</div></div>'
-                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 TARGET STRIKE (BEST OTM)</span>'
-                f'<div style="color:{best_otm_color}; font-size:13px; font-weight:bold; margin-top:2px;">{best_otm_label}</div></div>'
+                f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 BEST CANDIDATE</span>'
+                f'<div style="color:#64ffda; font-size:13px; font-weight:bold; margin-top:2px;">{best_opt_display}</div></div>'
                 f'</div>'
-                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ {banner_note}</div>'
+                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ Regime: {regime_key} | Spread: {price_spread:.1f} pts (Thresh: {spread_thresh})</div>'
                 f'</div>'
             )
             st.markdown(regime_html, unsafe_allow_html=True)
+
+            current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
 
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
@@ -606,7 +600,7 @@ if "access_token" in st.session_state:
                 f'</div>'
                 f'<div style="flex: 1.0; text-align:center; border-right: 1px solid #233554; padding: 0 8px;">'
                 f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Option IV</div>'
-                f'<div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{chain_iv_val * 100:.2f}%</div>'
+                f'<div style="color:#ccd6f6; font-size:20px; font-weight:700; margin-top:2px;">{current_iv_pct:.2f}%</div>'
                 f'</div>'
                 f'<div style="flex: 1.1; text-align:right; padding-left: 8px;">'
                 f'<div style="color:#8892b0; font-size:11px; font-weight:600; text-transform:uppercase;">Realized Vol</div>'
@@ -622,15 +616,23 @@ if "access_token" in st.session_state:
             st.line_chart(df_chart)
 
         with col_signal_card:
-            confirmations_status = (
-                f"{candidate.confirmation_count}/{required_confirmations} Confirmed" 
-                if candidate else f"0/{required_confirmations} Confirmed"
-            )
+            active_obj = st.session_state["candidate_tracker"].active_candidate
+            pending_obj = st.session_state["candidate_tracker"].pending_candidate
+
+            if active_obj:
+                confirmations_status = f"{active_obj.confirmation_count}/{required_confirmations} Confirmed (Active)"
+                tracked_symbol = active_obj.symbol
+            elif pending_obj:
+                confirmations_status = f"{pending_obj.confirmation_count}/{required_confirmations} Confirmed (Pending)"
+                tracked_symbol = pending_obj.symbol
+            else:
+                confirmations_status = f"0/{required_confirmations} Confirmed"
+                tracked_symbol = "Standby"
+
             score_display = f"{raw_points}/7 ({trend_strength:.1f}%)" if market_dir != MarketDirection.NEUTRAL else "0/7 (0.0%)"
-            score_color = "#2ecc71" if trend_strength >= required_min_score else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
-            gate_badge = "PASSED" if passed else "BLOCKED"
-            gate_badge_color = "#2ecc71" if passed else "#e74c3c"
-            cand_sym = candidate.symbol if candidate else "Standby"
+            score_color = "#2ecc71" if trend_strength >= 70.0 else ("#f1c40f" if trend_strength >= 50.0 else "#8892b0")
+            gate_badge = "PASSED" if passed_gate else "BLOCKED"
+            gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
             card_html = (
                 f'<div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border:1px solid #363c4e;">'
@@ -646,8 +648,8 @@ if "access_token" in st.session_state:
                 f'<b style="color:{gate_badge_color}; font-size:14px;">{gate_badge}</b>'
                 f'</div>'
                 f'</div>'
-                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Consensus: <b style="color:#ffffff;">{market_dir.name}</b></p>'
-                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Best Contract: <b style="color:#64ffda;">{cand_sym}</b></p>'
+                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Consensus: <b style="color:#ffffff;">{market_dir.value}</b></p>'
+                f'<p style="color:#848d9c; margin-bottom:4px; font-size:13px;">Tracked Contract: <b style="color:#64ffda;">{tracked_symbol}</b></p>'
                 f'<p style="color:#3498db; font-size:12px; margin-bottom:4px;">Stability: <b>{confirmations_status}</b></p>'
                 f'<p style="color:#57606a; font-size:11px; margin-top:6px;">Gate Info: {gate_msg}</p>'
                 f'</div>'
