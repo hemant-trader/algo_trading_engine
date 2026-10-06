@@ -3,6 +3,7 @@ import datetime
 import zoneinfo
 import requests
 import math
+import urllib.parse
 from typing import Optional, Dict, Tuple
 from core.types import OptionType, NormalizedOptionTick
 
@@ -67,7 +68,8 @@ class LiveExecutionQuoteProvider:
         """
         Fetches an isolated, real-time market-data quote for hard execution validation.
         """
-        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={instrument_key}"
+        encoded_key = urllib.parse.quote(instrument_key)
+        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={encoded_key}"
         headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
 
         try:
@@ -79,8 +81,24 @@ class LiveExecutionQuoteProvider:
             if res_json.get("status") != "success" or "data" not in res_json:
                 return None, "FAIL_CLOSED_MALFORMED_RESPONSE"
 
-            key_lookup = instrument_key.replace("|", ":")
-            quote_data = res_json.get("data", {}).get(key_lookup)
+            data_dict = res_json.get("data", {})
+            if not data_dict:
+                return None, "FAIL_CLOSED_EMPTY_QUOTE_DATA"
+
+            # Multi-pattern resilient key lookup
+            key_colon = instrument_key.replace("|", ":")
+            key_pipe = instrument_key.replace(":", "|")
+            
+            quote_data = (
+                data_dict.get(instrument_key) or 
+                data_dict.get(key_colon) or 
+                data_dict.get(key_pipe)
+            )
+
+            # Fallback agar API response dictionary me single element ho
+            if not quote_data and len(data_dict) == 1:
+                quote_data = next(iter(data_dict.values()))
+
             if not quote_data:
                 return None, "FAIL_CLOSED_INSTRUMENT_KEY_NOT_FOUND"
 
