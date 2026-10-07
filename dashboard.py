@@ -9,6 +9,7 @@ import urllib.parse
 import pandas as pd
 import numpy as np
 import streamlit as st
+from typing import Optional, List, Dict
 
 from config import UPSTOX_CONFIG
 from core.types import MarketDirection, OptionType, NormalizedOptionTick
@@ -32,6 +33,7 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 POLL_INTERVAL = 5.0
 JITTER_BUFFER = 3.0
 INITIAL_TTL_ESTIMATE = max(8.0, POLL_INTERVAL + JITTER_BUFFER + 2.0)
+MAX_LIVE_ALIGNMENT_DELAY_SECONDS = 90.0  # Frozen Freshness Policy
 
 INDEX_CONFIG = {
     "NIFTY 50": {"key": "NSE_INDEX|Nifty 50", "step": 50, "strike_mult": 50, "sideways_range": 25.0},
@@ -60,8 +62,8 @@ if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=int(INITIAL_TTL_ESTIMATE))
 if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
-if "last_bar_minute" not in st.session_state:
-    st.session_state["last_bar_minute"] = None
+if "last_processed_closed_ts" not in st.session_state:
+    st.session_state["last_processed_closed_ts"] = None
 
 def save_token_to_file(token_data):
     with open(TOKEN_FILE, "w") as f:
@@ -93,7 +95,8 @@ def get_access_token(code):
         return {"error": str(e)}
 
 def get_market_quote(instrument_key, token):
-    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={instrument_key}"
+    encoded_key = urllib.parse.quote(instrument_key)
+    url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_key}"
     headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
         response = requests.get(url, headers=headers, timeout=3)
@@ -128,6 +131,86 @@ def calculate_precise_tte(expiry_str):
     except Exception:
         return 0.005
 
+def parse_candle_iso_to_epoch(ts_val: str) -> float:
+    if not ts_val:
+        return 0.0
+    try:
+        clean_ts = str(ts_val).replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(clean_ts)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+def get_unprocessed_closed_5m_bars(instrument_key: str, token: str, last_processed_ts: Optional[str]) -> List[Dict]:
+    """
+    Fetches 5M candles from Upstox.
+    Strictly validates 5-minute grid alignment.
+    Strictly excludes the currently forming bar using deterministic wall-clock bucket threshold.
+    Returns ordered (oldest to newest) verified closed bars strictly newer than last_processed_ts.
+    """
+    encoded_key = urllib.parse.quote(instrument_key)
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/5minute"
+    headers = {"accept": "application/json"}
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=3.0)
+        if resp.status_code != 200:
+            return []
+
+        res_json = resp.json()
+        raw_candles = res_json.get("data", {}).get("candles", [])
+        if not raw_candles:
+            return []
+
+        # Current forming bucket cutoff
+        now_ist = datetime.datetime.now(IST)
+        current_bucket_minute = (now_ist.minute // 5) * 5
+        current_bucket_start = now_ist.replace(
+            minute=current_bucket_minute, second=0, microsecond=0
+        )
+
+        last_epoch = parse_candle_iso_to_epoch(last_processed_ts) if last_processed_ts else 0.0
+
+        closed_candidates = []
+        for c in raw_candles:
+            if len(c) < 6:
+                continue
+            c_ts = str(c[0])
+            c_epoch = parse_candle_iso_to_epoch(c_ts)
+            if c_epoch <= 0:
+                continue
+
+            c_dt = datetime.datetime.fromtimestamp(c_epoch, tz=IST)
+
+            # Strict 5-Minute Grid Boundary Alignment
+            bucket_minute = (c_dt.minute // 5) * 5
+            expected_bucket = c_dt.replace(minute=bucket_minute, second=0, microsecond=0)
+            if c_dt != expected_bucket:
+                continue
+
+            # Exclude forming bucket
+            if c_dt >= current_bucket_start:
+                continue
+
+            # Watermark check
+            if c_epoch > last_epoch:
+                closed_candidates.append({
+                    "timestamp": c_ts,
+                    "epoch": c_epoch,
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "volume": int(c[5])
+                })
+
+        # Ascending chronological sort (oldest to newest)
+        closed_candidates.sort(key=lambda x: x["epoch"])
+        return closed_candidates
+
+    except Exception:
+        return []
+
 saved_token_data = load_token_from_file()
 if saved_token_data and "access_token" in saved_token_data:
     st.session_state["access_token"] = saved_token_data["access_token"]
@@ -148,7 +231,6 @@ if auth_code and "access_token" not in st.session_state:
             st.session_state["access_token"] = res["access_token"]
             save_token_to_file(res)
 
-# Current token resolution
 current_token = st.session_state.get("access_token", None)
 curr_inst_key = INDEX_CONFIG[st.session_state["selected_index"]]["key"]
 
@@ -223,10 +305,11 @@ if selected_index != st.session_state["selected_index"]:
     st.session_state["price_history"] = []
     st.session_state["candidate_tracker"].flush()
     st.session_state["expiry_manager"].flush_cache()
+    st.session_state["last_processed_closed_ts"] = None
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🛡️️ Safety Settings")
+st.sidebar.subheader("🛡️ Safety Settings")
 max_loss = st.sidebar.number_input("Max Daily Loss (₹)", value=2000)
 target_pnl = st.sidebar.number_input("Daily Target PnL (₹)", value=4000)
 
@@ -262,6 +345,7 @@ else:
         st.session_state["price_history"] = []
         st.session_state["candidate_tracker"].flush()
         st.session_state["expiry_manager"].flush_cache()
+        st.session_state["last_processed_closed_ts"] = None
         st.rerun()
 
 # ================= TECHNICAL ENGINE =================
@@ -356,7 +440,7 @@ if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
     token = st.session_state["access_token"]
     
-    # 1. API Call with Precise Network Latency Measurement
+    # Ingress Spot Quote
     t_req_start = time.time()
     quote_data = get_market_quote(inst_key, token)
     api_latency = max(0.1, time.time() - t_req_start)
@@ -364,47 +448,30 @@ if "access_token" in st.session_state:
     spot_ltp = None
     if quote_data and "data" in quote_data:
         key_name = inst_key.replace("|", ":")
-        if key_name in quote_data["data"]:
-            spot_ltp = float(quote_data["data"][key_name]["last_price"])
+        quote_dict = quote_data.get("data", {})
+        target_obj = quote_dict.get(key_name) or quote_dict.get(inst_key)
+        if target_obj and "last_price" in target_obj:
+            spot_ltp = float(target_obj["last_price"])
 
     if spot_ltp is not None:
         dynamic_ttl = max(8.0, POLL_INTERVAL + api_latency + JITTER_BUFFER)
         st.session_state["ttl_manager"].max_ttl = int(np.ceil(dynamic_ttl))
         st.session_state["ttl_manager"].pulse(True)
 
-        st.session_state["price_history"].append(spot_ltp)
-        if len(st.session_state["price_history"]) > 50:
-            st.session_state["price_history"].pop(0)
-
         st.session_state["seq_counter"] += 1
         current_seq = st.session_state["seq_counter"]
 
-        market_dir, raw_points, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
-            st.session_state["price_history"], selected_index
-        )
-
         realized_vol = calculate_realized_volatility(st.session_state["price_history"])
 
-        # 5M Closed Bar Detection & Idempotency
-        now_time = datetime.datetime.now(IST)
-        current_bar_min = now_time.minute - (now_time.minute % 5)
-        bar_identifier = f"{now_time.strftime('%Y-%m-%d %H')}:{current_bar_min:02d}:00"
-        
-        is_new_closed_bar = False
-        if st.session_state["last_bar_minute"] != current_bar_min:
-            # Startup partial drop: only trigger after first known boundary
-            if st.session_state["last_bar_minute"] is not None:
-                is_new_closed_bar = True
-            st.session_state["last_bar_minute"] = current_bar_min
+        # Default values for dashboard UI
+        market_dir = MarketDirection.NEUTRAL
+        raw_points = 0
+        trend_strength = 0.0
+        rsi_val = 50.0
+        price_spread = 0.0
+        regime_key = "STANDBY"
+        spread_thresh = INDEX_CONFIG[selected_index]["sideways_range"]
 
-        # 2-Stage Confirmation Configuration
-        is_strong_momentum = (
-            (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
-            (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
-        )
-        required_confirmations = 2 if is_strong_momentum else 3
-
-        # State Variables
         best_candidate = None
         scan_diag = {}
         candidate_state = None
@@ -415,121 +482,209 @@ if "access_token" in st.session_state:
         final_action = "NO TRADE"
         action_color = "#f1c40f"
         live_quote = None
+        is_new_closed_bar = False
 
         # -------------------------------------------------------------
-        # STRICT FAIL-CLOSED EXECUTION PIPELINE
+        # ORDERED CLOSED-BAR SYNCHRONIZATION PIPELINE
         # -------------------------------------------------------------
-        if active_expiry is None:
-            st.session_state["candidate_tracker"].flush()
-            final_action = "NO TRADE"
-            gate_msg = f"BLOCKED_EXPIRY: {expiry_status}"
+        unprocessed_bars = get_unprocessed_closed_5m_bars(
+            inst_key, token, st.session_state["last_processed_closed_ts"]
+        )
 
-        elif expiry_rotated:
-            st.session_state["candidate_tracker"].flush()
-            final_action = "NO TRADE"
-            gate_msg = f"EXPIRY_ROTATED: Transition cycle skipped for {active_expiry}"
+        # Baseline alignment on cold start
+        if st.session_state["last_processed_closed_ts"] is None:
+            if unprocessed_bars:
+                st.session_state["last_processed_closed_ts"] = unprocessed_bars[-1]["timestamp"]
+            unprocessed_bars = []
 
-        elif market_dir == MarketDirection.NEUTRAL:
-            st.session_state["candidate_tracker"].flush()
-            final_action = "NO TRADE"
-            gate_msg = "MARKET_REGIME_NEUTRAL"
+        bar_to_evaluate = None
 
-        else:
-            # 1. Fetch Option Chain Snapshot
-            chain_data = get_option_chain_data(inst_key, active_expiry, token)
-            if not chain_data:
-                gate_msg = "BLOCKED_CHAIN_API_EMPTY"
+        if len(unprocessed_bars) > 1:
+            # Reconcile stale intermediate bars strictly into price history buffer
+            for stale_bar in unprocessed_bars[:-1]:
+                st.session_state["price_history"].append(stale_bar["close"])
+                if len(st.session_state["price_history"]) > 50:
+                    st.session_state["price_history"].pop(0)
+
+            # Continuity broken: safely flush tracker
+            st.session_state["candidate_tracker"].flush()
+
+            # Inspect latest bar against strict freshness gate
+            latest_bar = unprocessed_bars[-1]
+            bar_close_epoch = latest_bar["epoch"] + (5 * 60)
+            bar_age_seconds = time.time() - bar_close_epoch
+
+            if bar_age_seconds <= MAX_LIVE_ALIGNMENT_DELAY_SECONDS:
+                bar_to_evaluate = latest_bar
             else:
-                # 2. Scanner: Exact 1 Winner with Finite Math & Explicit Decimal IV
-                best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
-                    chain_data=chain_data,
-                    direction=market_dir,
-                    trend_score=trend_strength
+                st.session_state["price_history"].append(latest_bar["close"])
+                if len(st.session_state["price_history"]) > 50:
+                    st.session_state["price_history"].pop(0)
+                st.session_state["last_processed_closed_ts"] = latest_bar["timestamp"]
+                gate_msg = f"STALE_GAP_FLUSH (Age: {bar_age_seconds:.1f}s > {MAX_LIVE_ALIGNMENT_DELAY_SECONDS}s)"
+
+        elif len(unprocessed_bars) == 1:
+            single_bar = unprocessed_bars[0]
+            bar_close_epoch = single_bar["epoch"] + (5 * 60)
+            bar_age_seconds = time.time() - bar_close_epoch
+
+            if bar_age_seconds <= MAX_LIVE_ALIGNMENT_DELAY_SECONDS:
+                bar_to_evaluate = single_bar
+            else:
+                st.session_state["price_history"].append(single_bar["close"])
+                if len(st.session_state["price_history"]) > 50:
+                    st.session_state["price_history"].pop(0)
+                st.session_state["candidate_tracker"].flush()
+                st.session_state["last_processed_closed_ts"] = single_bar["timestamp"]
+                gate_msg = f"SINGLE_BAR_STALE_FLUSH (Age: {bar_age_seconds:.1f}s > {MAX_LIVE_ALIGNMENT_DELAY_SECONDS}s)"
+
+        # Strictly ONE Synchronous Closed Bar Evaluation
+        if bar_to_evaluate is not None:
+            is_new_closed_bar = True
+            bar_identifier = bar_to_evaluate["timestamp"]
+
+            try:
+                # 1. Update spot buffer with verified closed bar price
+                st.session_state["price_history"].append(bar_to_evaluate["close"])
+                if len(st.session_state["price_history"]) > 50:
+                    st.session_state["price_history"].pop(0)
+
+                # 2. Evaluate regime on confirmed closed bar sequence
+                market_dir, raw_points, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
+                    st.session_state["price_history"], selected_index
                 )
 
-                if best_candidate is None:
-                    gate_msg = "BLOCKED_SCANNER: 0 candidates cleared hard bounds"
+                is_strong_momentum = (
+                    (market_dir == MarketDirection.BULLISH and rsi_val >= 65.0) or
+                    (market_dir == MarketDirection.BEARISH and rsi_val <= 35.0)
+                )
+                required_confirmations = 2 if is_strong_momentum else 3
+
+                if active_expiry is None:
+                    st.session_state["candidate_tracker"].flush()
+                    final_action = "NO TRADE"
+                    gate_msg = f"BLOCKED_EXPIRY: {expiry_status}"
+
+                elif expiry_rotated:
+                    st.session_state["candidate_tracker"].flush()
+                    final_action = "NO TRADE"
+                    gate_msg = f"EXPIRY_ROTATED: Transition cycle skipped for {active_expiry}"
+
+                elif market_dir == MarketDirection.NEUTRAL:
+                    st.session_state["candidate_tracker"].flush()
+                    final_action = "NO TRADE"
+                    gate_msg = "MARKET_REGIME_NEUTRAL"
+
                 else:
-                    cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-
-                    # 3. Tracker: Single Call with Closed-Bar Idempotency
-                    candidate_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                        symbol=cand_sym,
-                        strike=best_candidate["strike"],
-                        option_type=best_candidate["option_type"],
-                        score=best_candidate["score"],
-                        direction=market_dir,
-                        bar_timestamp=bar_identifier,
-                        is_new_closed_bar=is_new_closed_bar,
-                        required_confirmations=required_confirmations
-                    )
-
-                    if not is_ready:
-                        gate_msg = f"CONFIRMATION_PENDING ({candidate_state.confirmation_count if candidate_state else 0}/{required_confirmations})"
+                    # 3. Live Option Chain Snapshot Fetch
+                    chain_data = get_option_chain_data(inst_key, active_expiry, token)
+                    if not chain_data:
+                        gate_msg = "BLOCKED_CHAIN_API_EMPTY"
                     else:
-                        # 4. 5-Point Immutable Contract Authority Match
-                        id_ok, id_msg = ContractIdentityAuthority.verify_against_broker_universe(
-                            instrument_key=best_candidate["instrument_key"],
-                            expected_underlying_key=inst_key,
-                            expected_strike=best_candidate["strike"],
-                            expected_type=best_candidate["option_type"],
-                            expected_expiry=active_expiry,
-                            active_contracts=active_contracts
+                        # 4. Multi-Factor Option Scanner
+                        best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
+                            chain_data=chain_data,
+                            direction=market_dir,
+                            trend_score=trend_strength
                         )
 
-                        if not id_ok:
-                            final_action = "NO TRADE"
-                            gate_msg = f"BLOCKED_IDENTITY: {id_msg}"
+                        if best_candidate is None:
+                            gate_msg = "BLOCKED_SCANNER: 0 candidates cleared hard bounds"
                         else:
-                            # 5. Fresh Execution Quote Snapshot
-                            exact_tte = calculate_precise_tte(active_expiry)
-                            live_quote, quote_status = st.session_state["quote_provider"].fetch_execution_quote(
-                                instrument_key=best_candidate["instrument_key"],
+                            cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+
+                            # 5. Tracker Evaluation: Discrete 1-call per verified closed bar
+                            candidate_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
                                 symbol=cand_sym,
-                                underlying=selected_index,
-                                underlying_spot=spot_ltp,
-                                expiry=active_expiry,
                                 strike=best_candidate["strike"],
                                 option_type=best_candidate["option_type"],
-                                token=token,
-                                tte=exact_tte,
-                                seq_no=current_seq,
-                                iv_decimal=best_candidate["iv_decimal"]
+                                score=best_candidate["score"],
+                                direction=market_dir,
+                                bar_timestamp=bar_identifier,
+                                is_new_closed_bar=True,
+                                required_confirmations=required_confirmations
                             )
 
-                            if live_quote is None:
-                                gate_msg = f"BLOCKED_QUOTE: {quote_status}"
+                            if not is_ready:
+                                gate_msg = f"CONFIRMATION_PENDING ({candidate_state.confirmation_count if candidate_state else 0}/{required_confirmations})"
                             else:
-                                # 6. Black-Scholes Greeks Engine
-                                bs_greeks = BlackScholesEngine.calculate_greeks(
-                                    spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
+                                # 6. Contract Identity Authority Verification
+                                id_ok, id_msg = ContractIdentityAuthority.verify_against_broker_universe(
+                                    instrument_key=best_candidate["instrument_key"],
+                                    expected_underlying_key=inst_key,
+                                    expected_strike=best_candidate["strike"],
+                                    expected_type=best_candidate["option_type"],
+                                    expected_expiry=active_expiry,
+                                    active_contracts=active_contracts
                                 )
 
-                                # 7. Authoritative Zero-Trust Final Safety Gate
-                                passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
-                                    market_direction=market_dir,
-                                    tick=live_quote,
-                                    greeks=bs_greeks,
-                                    candidate=candidate_state,
-                                    candidate_ready=is_ready,
-                                    ttl_state=st.session_state["ttl_manager"],
-                                    quality_grade="GRADE_A",
-                                    max_spread_pct=0.03,
-                                    min_delta=0.45,
-                                    max_delta=0.65
-                                )
-
-                                if passed_gate:
-                                    final_action = f"BUY {best_candidate['option_type'].value}"
-                                    action_color = "#ff4b4b" if best_candidate["option_type"] == OptionType.PE else "#2ecc71"
-                                else:
+                                if not id_ok:
                                     final_action = "NO TRADE"
-                                    action_color = "#f1c40f"
+                                    gate_msg = f"BLOCKED_IDENTITY: {id_msg}"
+                                else:
+                                    # 7. Live Execution Quote Ingestion
+                                    exact_tte = calculate_precise_tte(active_expiry)
+                                    live_quote, quote_status = st.session_state["quote_provider"].fetch_execution_quote(
+                                        instrument_key=best_candidate["instrument_key"],
+                                        symbol=cand_sym,
+                                        underlying=selected_index,
+                                        underlying_spot=spot_ltp,
+                                        expiry=active_expiry,
+                                        strike=best_candidate["strike"],
+                                        option_type=best_candidate["option_type"],
+                                        token=token,
+                                        tte=exact_tte,
+                                        seq_no=current_seq,
+                                        iv_decimal=best_candidate["iv_decimal"]
+                                    )
+
+                                    if live_quote is None:
+                                        gate_msg = f"BLOCKED_QUOTE: {quote_status}"
+                                    else:
+                                        # 8. Black-Scholes Greeks Engine
+                                        bs_greeks = BlackScholesEngine.calculate_greeks(
+                                            spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
+                                        )
+
+                                        # 9. Authoritative Zero-Trust Safety Gate
+                                        passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
+                                            market_direction=market_dir,
+                                            tick=live_quote,
+                                            greeks=bs_greeks,
+                                            candidate=candidate_state,
+                                            candidate_ready=is_ready,
+                                            ttl_state=st.session_state["ttl_manager"],
+                                            quality_grade="GRADE_A",
+                                            max_spread_pct=0.03,
+                                            min_delta=0.45,
+                                            max_delta=0.65
+                                        )
+
+                                        if passed_gate:
+                                            final_action = f"BUY {best_candidate['option_type'].value}"
+                                            action_color = "#ff4b4b" if best_candidate["option_type"] == OptionType.PE else "#2ecc71"
+                                        else:
+                                            final_action = "NO TRADE"
+                                            action_color = "#f1c40f"
+
+                # POST-SUCCESS MONOTONIC WATERMARK COMMIT
+                st.session_state["last_processed_closed_ts"] = bar_identifier
+
+            except Exception as exc:
+                st.error(f"Closed-bar processing error on {bar_identifier}: {str(exc)}")
+                # Watermark intentionally NOT advanced on processing error
+
+        else:
+            # Re-read regime for dashboard display when no new closed bar occurs
+            if len(st.session_state["price_history"]) >= 15:
+                market_dir, raw_points, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
+                    st.session_state["price_history"], selected_index
+                )
 
         # -------------------------------------------------------------
-        # HEADLESS OBSERVATION TELEMETRY (Read-Only Observer)
+        # HEADLESS OBSERVATION TELEMETRY LOGGER
         # -------------------------------------------------------------
-        if is_new_closed_bar:
+        if is_new_closed_bar and bar_to_evaluate is not None:
             quote_age_ms = None
             if live_quote is not None:
                 quote_age_ms = (time.time() - live_quote.timestamp) * 1000.0
@@ -538,7 +693,7 @@ if "access_token" in st.session_state:
             tracker_inst = st.session_state["candidate_tracker"]
 
             st.session_state["telemetry_logger"].record_bar_event(
-                bar_timestamp=bar_identifier,
+                bar_timestamp=bar_to_evaluate["timestamp"],
                 sequence_no=current_seq,
                 underlying=selected_index,
                 spot_ltp=spot_ltp,
@@ -581,7 +736,7 @@ if "access_token" in st.session_state:
                 f'<div style="text-align:right;"><span style="color:#8892b0; font-size:11px; text-transform:uppercase;">🎯 BEST CANDIDATE</span>'
                 f'<div style="color:#64ffda; font-size:13px; font-weight:bold; margin-top:2px;">{best_opt_display}</div></div>'
                 f'</div>'
-                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ Regime: {regime_key} | Spread: {price_spread:.1f} pts (Thresh: {spread_thresh})</div>'
+                f'<div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">ℹ️ Regime: {regime_key} | Spread: {price_spread:.1f} pts (Thresh: {spread_thresh}) | Last Closed Bar: {st.session_state["last_processed_closed_ts"]}</div>'
                 f'</div>'
             )
             st.markdown(regime_html, unsafe_allow_html=True)
@@ -620,13 +775,13 @@ if "access_token" in st.session_state:
             pending_obj = st.session_state["candidate_tracker"].pending_candidate
 
             if active_obj:
-                confirmations_status = f"{active_obj.confirmation_count}/{required_confirmations} Confirmed (Active)"
+                confirmations_status = f"{active_obj.confirmation_count}/{required_confirmations if 'required_confirmations' in locals() else 2} Confirmed (Active)"
                 tracked_symbol = active_obj.symbol
             elif pending_obj:
-                confirmations_status = f"{pending_obj.confirmation_count}/{required_confirmations} Confirmed (Pending)"
+                confirmations_status = f"{pending_obj.confirmation_count}/{required_confirmations if 'required_confirmations' in locals() else 2} Confirmed (Pending)"
                 tracked_symbol = pending_obj.symbol
             else:
-                confirmations_status = f"0/{required_confirmations} Confirmed"
+                confirmations_status = f"0/{required_confirmations if 'required_confirmations' in locals() else 2} Confirmed"
                 tracked_symbol = "Standby"
 
             score_display = f"{raw_points}/7 ({trend_strength:.1f}%)" if market_dir != MarketDirection.NEUTRAL else "0/7 (0.0%)"
