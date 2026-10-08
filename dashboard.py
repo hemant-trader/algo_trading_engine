@@ -73,18 +73,6 @@ if "pre_alert_tick_count" not in st.session_state:
 if "cached_itm_candidate" not in st.session_state:
     st.session_state["cached_itm_candidate"] = None
 
-def get_avatar_base64():
-    """Finds avatar.png in current or assets folder and returns base64 string"""
-    paths = ["avatar.png", "assets/avatar.png"]
-    for p in paths:
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as img_f:
-                    return base64.b64encode(img_f.read()).decode()
-            except Exception:
-                pass
-    return None
-
 def save_token_to_file(token_data):
     with open(TOKEN_FILE, "w") as f:
         json.dump(token_data, f)
@@ -252,11 +240,19 @@ if current_token:
         curr_inst_key, current_token
     )
 
-# ================= SIDEBAR CONTROLS =================
+# ================= SIDEBAR CONTROLS WITH 10:30 AM DISCIPLINE RULE =================
 now_ist = datetime.datetime.now(IST)
 current_date_str = now_ist.strftime("%d %b %Y")
 current_time_str = now_ist.strftime("%I:%M:%S %p")
 today_iso = now_ist.strftime("%Y-%m-%d")
+
+# 10:30 AM IST Cutoff Detection
+cutoff_time = datetime.time(10, 30, 0)
+is_after_cutoff = now_ist.time() >= cutoff_time
+
+# Watch color: White before 10:30 AM, Red alert after 10:30 AM
+time_font_color = "#ff4d4f; font-weight:800;" if is_after_cutoff else "#ffffff; font-weight:600;"
+time_icon = "🛑" if is_after_cutoff else "🕒"
 
 if active_expiry == today_iso:
     expiry_tag = '<span style="color:#ff4d4f; font-weight:700;">🔥 TODAY EXPIRY (0 DTE)</span>'
@@ -274,8 +270,8 @@ else:
 
 sidebar_top_badge = (
     f'<div style="background-color:#111622; border:1px solid #1f293d; border-radius:8px; padding:8px 10px; margin-bottom:12px; font-size:11px;">'
-    f'<div style="display:flex; justify-content:space-between; color:#8b949e; font-family:monospace; margin-bottom:4px;">'
-    f'<span>📅 {current_date_str}</span><span>🕒 {current_time_str}</span>'
+    f'<div style="display:flex; justify-content:space-between; align-items:center; font-family:monospace; margin-bottom:4px;">'
+    f'<span style="color:#8b949e;">📅 {current_date_str}</span><span style="color:{time_font_color}">{time_icon} {current_time_str}</span>'
     f'</div>'
     f'<div style="border-top:1px solid #1f293d; padding-top:4px; text-align:center; color:#ccd6f6;">'
     f'{expiry_tag}'
@@ -487,33 +483,30 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= MAIN RUNTIME WITH RIGHT-ALIGNED SEAMLESS AVATAR =================
-avatar_b64 = get_avatar_base64()
+# ================= MAIN RUNTIME WITH DYNAMIC DISCIPLINE AVATAR =================
+col_title, col_avatar = st.columns([3.8, 1.2])
 
-if avatar_b64:
-    header_html = f"""<div style="display:flex; justify-content:space-between; align-items:center; width:100%; margin-bottom:16px; padding:6px 0;">
-  <div style="display:flex; align-items:center; gap:10px;">
-    <span style="font-size:36px; line-height:1;">⚡</span>
-    <h1 style="margin:0; font-size:36px; font-weight:900; line-height:1.1; letter-spacing:-0.5px;">
-      <span style="color:#111111;">Hemant </span>
-      <span style="color:#e74c3c;">Algo </span>
-      <span style="color:#111111;">Trading Engine</span>
-    </h1>
-  </div>
-  <div style="flex-shrink:0; margin-right:8px;">
-    <img src="data:image/png;base64,{avatar_b64}" style="width:145px; height:145px; border-radius:12px; border:none; outline:none; object-fit:cover; display:block;">
-  </div>
-</div>"""
+with col_title:
+    header_html = """
+    <div style="display:flex; align-items:center; gap:12px; padding:10px 0;">
+        <span style="font-size:42px; line-height:1;">⚡</span>
+        <h1 style="margin:0; font-size:38px; font-weight:900; line-height:1.1; letter-spacing:-0.5px;">
+            <span style="color:#111111;">Hemant </span>
+            <span style="color:#e74c3c;">Algo </span>
+            <span style="color:#111111;">Trading Engine</span>
+        </h1>
+    </div>
+    """
     st.markdown(header_html, unsafe_allow_html=True)
-else:
-    header_html = """<div style="margin-bottom:16px;">
-  <h1 style="margin:0; font-size:36px; font-weight:900;">
-    ⚡ <span style="color:#111111;">Hemant </span>
-    <span style="color:#e74c3c;">Algo </span>
-    <span style="color:#111111;">Trading Engine</span>
-  </h1>
-</div>"""
-    st.markdown(header_html, unsafe_allow_html=True)
+
+with col_avatar:
+    # 10:30 AM IST Switch: Normal avatar before 10:30 AM, Discipline poster after 10:30 AM
+    if is_after_cutoff:
+        avatar_url = "https://raw.githubusercontent.com/hemant-trader/algo_trading_engine/main/rule_avatar.png"
+    else:
+        avatar_url = "https://raw.githubusercontent.com/hemant-trader/algo_trading_engine/main/avatar.png"
+        
+    st.image(avatar_url, width=155)
 
 is_armed_simulation = "🟡 ARMED" in trade_mode
 if is_armed_simulation:
