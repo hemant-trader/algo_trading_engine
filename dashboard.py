@@ -240,17 +240,17 @@ if current_token:
         curr_inst_key, current_token
     )
 
-# ================= SIDEBAR CONTROLS WITH 10:30 AM DISCIPLINE RULE =================
+# ================= SIDEBAR CONTROLS (10:30 AM CUTOFF LOGIC) =================
 now_ist = datetime.datetime.now(IST)
 current_date_str = now_ist.strftime("%d %b %Y")
 current_time_str = now_ist.strftime("%I:%M:%S %p")
 today_iso = now_ist.strftime("%Y-%m-%d")
 
-# 10:30 AM IST Cutoff Detection
+# 10:30 AM Cutoff Check
 cutoff_time = datetime.time(10, 30, 0)
 is_after_cutoff = now_ist.time() >= cutoff_time
 
-# Watch color: White before 10:30 AM, Red alert after 10:30 AM
+# Clock color: White before 10:30 AM, Red after 10:30 AM
 time_font_color = "#ff4d4f; font-weight:800;" if is_after_cutoff else "#ffffff; font-weight:600;"
 time_icon = "🛑" if is_after_cutoff else "🕒"
 
@@ -483,7 +483,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= MAIN RUNTIME WITH DYNAMIC DISCIPLINE AVATAR =================
+# ================= MAIN RUNTIME WITH LOCAL DYNAMIC AVATAR =================
 col_title, col_avatar = st.columns([3.8, 1.2])
 
 with col_title:
@@ -500,13 +500,26 @@ with col_title:
     st.markdown(header_html, unsafe_allow_html=True)
 
 with col_avatar:
-    # 10:30 AM IST Switch: Normal avatar before 10:30 AM, Discipline poster after 10:30 AM
-    if is_after_cutoff:
-        avatar_url = "https://raw.githubusercontent.com/hemant-trader/algo_trading_engine/main/rule_avatar.png"
-    else:
-        avatar_url = "https://raw.githubusercontent.com/hemant-trader/algo_trading_engine/main/avatar.png"
-        
-    st.image(avatar_url, width=155)
+    # 10:30 AM Rule: Normal avatar before 10:30 AM, Discipline poster after 10:30 AM
+    target_img_name = "rule_avatar.png" if is_after_cutoff else "avatar.png"
+    
+    # Resolving exact file path on local / Streamlit Cloud filesystem
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    img_candidates = [
+        os.path.join(base_dir, target_img_name),
+        target_img_name,
+        os.path.join(base_dir, "assets", target_img_name),
+        os.path.join("assets", target_img_name)
+    ]
+    
+    resolved_img_path = None
+    for cand in img_candidates:
+        if os.path.exists(cand):
+            resolved_img_path = cand
+            break
+            
+    if resolved_img_path:
+        st.image(resolved_img_path, width=155)
 
 is_armed_simulation = "🟡 ARMED" in trade_mode
 if is_armed_simulation:
