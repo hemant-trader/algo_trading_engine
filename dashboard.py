@@ -65,11 +65,9 @@ if "seq_counter" not in st.session_state:
 if "last_processed_closed_ts" not in st.session_state:
     st.session_state["last_processed_closed_ts"] = None
 
-# Fluctuation-free Pre-Alert Buffer State
+# Pre-Alert Buffer State
 if "pre_alert_direction" not in st.session_state:
     st.session_state["pre_alert_direction"] = "NEUTRAL"
-if "pre_alert_tick_count" not in st.session_state:
-    st.session_state["pre_alert_tick_count"] = 0
 if "cached_itm_candidate" not in st.session_state:
     st.session_state["cached_itm_candidate"] = None
 
@@ -243,7 +241,7 @@ if current_token:
     except Exception as exc:
         expiry_status = str(exc)
 
-# Fallback Expiry Date: Agar expiry manager date na nikal sake toh auto-resolve karein
+# Fallback Expiry Date: Auto-resolve weekly expiry if manager cannot fetch
 if not active_expiry:
     today_dt = datetime.datetime.now(IST).date()
     target_weekday = 4 if "SENSEX" in st.session_state["selected_index"] else 3
@@ -322,7 +320,6 @@ if selected_index != st.session_state["selected_index"]:
     st.session_state["expiry_manager"].flush_cache()
     st.session_state["last_processed_closed_ts"] = None
     st.session_state["pre_alert_direction"] = "NEUTRAL"
-    st.session_state["pre_alert_tick_count"] = 0
     st.session_state["cached_itm_candidate"] = None
     st.rerun()
 
@@ -365,7 +362,6 @@ else:
         st.session_state["expiry_manager"].flush_cache()
         st.session_state["last_processed_closed_ts"] = None
         st.session_state["pre_alert_direction"] = "NEUTRAL"
-        st.session_state["pre_alert_tick_count"] = 0
         st.session_state["cached_itm_candidate"] = None
         st.rerun()
 
@@ -512,10 +508,7 @@ with col_title:
     st.markdown(header_html, unsafe_allow_html=True)
 
 with col_avatar:
-    # 10:30 AM Rule: Normal avatar before 10:30 AM, Discipline poster after 10:30 AM
     target_img_name = "rule_avatar.png" if is_after_cutoff else "avatar.png"
-    
-    # Resolving exact file path on local / Streamlit Cloud filesystem
     base_dir = os.path.dirname(os.path.abspath(__file__))
     img_candidates = [
         os.path.join(base_dir, target_img_name),
@@ -588,23 +581,9 @@ if "access_token" in st.session_state:
         )
         required_confirmations = 2 if is_strong_momentum else 3
 
-        # Zero-Fluctuation Hysteresis Logic for Pre-Alert
-        live_dir_str = market_dir.value
-        current_pre_alert = st.session_state["pre_alert_direction"]
-
-        if live_dir_str != current_pre_alert:
-            if live_dir_str != "NEUTRAL":
-                st.session_state["pre_alert_tick_count"] += 1
-                if st.session_state["pre_alert_tick_count"] >= 2:
-                    st.session_state["pre_alert_direction"] = live_dir_str
-                    st.session_state["pre_alert_tick_count"] = 0
-            else:
-                st.session_state["pre_alert_direction"] = "NEUTRAL"
-                st.session_state["pre_alert_tick_count"] = 0
-        else:
-            st.session_state["pre_alert_tick_count"] = 0
-
-        stable_pre_alert = st.session_state["pre_alert_direction"]
+        # Instant Early Pre-Alert: Momentum bante hi turant notify karega
+        stable_pre_alert = market_dir.value
+        st.session_state["pre_alert_direction"] = stable_pre_alert
 
         best_candidate = None
         scan_diag = {}
@@ -690,16 +669,19 @@ if "access_token" in st.session_state:
 
                 if active_expiry is None:
                     st.session_state["candidate_tracker"].flush()
+                    st.session_state["cached_itm_candidate"] = None
                     final_action = "NO TRADE"
                     gate_msg = f"BLOCKED_EXPIRY: {expiry_status}"
 
                 elif expiry_rotated:
                     st.session_state["candidate_tracker"].flush()
+                    st.session_state["cached_itm_candidate"] = None
                     final_action = "NO TRADE"
                     gate_msg = f"EXPIRY_ROTATED: Transition cycle skipped for {active_expiry}"
 
                 elif market_dir == MarketDirection.NEUTRAL:
                     st.session_state["candidate_tracker"].flush()
+                    st.session_state["cached_itm_candidate"] = None
                     final_action = "NO TRADE"
                     gate_msg = "MARKET_REGIME_NEUTRAL"
 
@@ -796,6 +778,13 @@ if "access_token" in st.session_state:
             except Exception as exc:
                 st.error(f"Evaluation error on {bar_identifier}: {str(exc)}")
 
+        else:
+            if market_dir == MarketDirection.NEUTRAL:
+                st.session_state["candidate_tracker"].flush()
+                st.session_state["cached_itm_candidate"] = None
+                final_action = "NO TRADE"
+                gate_msg = "MARKET_REGIME_NEUTRAL"
+
         if is_new_closed_bar and bar_to_evaluate is not None:
             quote_age_ms = (time.time() - live_quote.timestamp) * 1000.0 if live_quote is not None else None
             hypothetical_fill = live_quote.ask if (passed_gate and live_quote is not None) else None
@@ -835,7 +824,7 @@ if "access_token" in st.session_state:
             trend_focus = f"MOMENTUM {market_dir.value}" if market_dir != MarketDirection.NEUTRAL else "STANDBY / AVOID CHOP"
             best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})" if best_candidate else "NONE"
 
-            # Pre-Alert HTML Generation (Zero Fluctuation Display)
+            # Pre-Alert HTML Generation (Instant Fast-Layer)
             if stable_pre_alert == "BULLISH":
                 win_prob = min(92, int(60 + (trend_strength * 0.35)))
                 accuracy_pct = 88
@@ -907,16 +896,26 @@ if "access_token" in st.session_state:
             st.line_chart(df_chart)
 
         with col_signal_card:
+            # Force cleanup if market is NEUTRAL or SIDEWAYS
+            if market_dir == MarketDirection.NEUTRAL:
+                st.session_state["candidate_tracker"].flush()
+                st.session_state["cached_itm_candidate"] = None
+
             active_obj = st.session_state["candidate_tracker"].active_candidate
             pending_obj = st.session_state["candidate_tracker"].pending_candidate
 
             target_conf = required_confirmations
 
-            if active_obj:
-                confirmations_status = f"{active_obj.confirmation_count}/{target_conf} Confirmed (Active)"
+            if market_dir == MarketDirection.NEUTRAL:
+                confirmations_status = f"0/{target_conf} Confirmed"
+                tracked_symbol = "Standby"
+            elif active_obj:
+                safe_count = min(active_obj.confirmation_count, target_conf)
+                confirmations_status = f"{safe_count}/{target_conf} Confirmed (Active)"
                 tracked_symbol = active_obj.symbol
             elif pending_obj:
-                confirmations_status = f"{pending_obj.confirmation_count}/{target_conf} Confirmed (Pending)"
+                safe_count = min(pending_obj.confirmation_count, target_conf)
+                confirmations_status = f"{safe_count}/{target_conf} Confirmed (Pending)"
                 tracked_symbol = pending_obj.symbol
             elif st.session_state["cached_itm_candidate"]:
                 confirmations_status = f"1/{target_conf} Monitoring ITM"
