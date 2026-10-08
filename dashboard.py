@@ -243,10 +243,9 @@ if current_token:
     except Exception as exc:
         expiry_status = str(exc)
 
-# Fallback Expiry Date: Agar expiry manager date resolve na kar sake toh automatic weekly expiry nikalega
+# Fallback Expiry Date: Agar expiry manager date na nikal sake toh auto-resolve karein
 if not active_expiry:
     today_dt = datetime.datetime.now(IST).date()
-    # NIFTY / BANKNIFTY Thursday (weekday 3), SENSEX Friday (weekday 4)
     target_weekday = 4 if "SENSEX" in st.session_state["selected_index"] else 3
     days_ahead = (target_weekday - today_dt.weekday()) % 7
     target_expiry = today_dt + datetime.timedelta(days=days_ahead)
@@ -666,14 +665,18 @@ if "access_token" in st.session_state:
                 st.session_state["last_processed_closed_ts"] = single_bar["timestamp"]
                 gate_msg = f"SINGLE_BAR_STALE_FLUSH (Age: {bar_age_seconds:.1f}s > {MAX_LIVE_ALIGNMENT_DELAY_SECONDS}s)"
 
-        if bar_to_evaluate is not None:
-            is_new_closed_bar = True
-            bar_identifier = bar_to_evaluate["timestamp"]
+        # Live Evaluation: Closed Bar aane par ya strong trend confirm hone par execute karein
+        should_evaluate = (bar_to_evaluate is not None) or (market_dir != MarketDirection.NEUTRAL and len(st.session_state["price_history"]) >= 15)
+
+        if should_evaluate:
+            is_new_closed_bar = (bar_to_evaluate is not None)
+            bar_identifier = bar_to_evaluate["timestamp"] if bar_to_evaluate is not None else datetime.datetime.now(IST).strftime("%Y-%m-%dT%H:%M:%S")
 
             try:
-                st.session_state["price_history"].append(bar_to_evaluate["close"])
-                if len(st.session_state["price_history"]) > 50:
-                    st.session_state["price_history"].pop(0)
+                if bar_to_evaluate is not None:
+                    st.session_state["price_history"].append(bar_to_evaluate["close"])
+                    if len(st.session_state["price_history"]) > 50:
+                        st.session_state["price_history"].pop(0)
 
                 market_dir, raw_points, trend_strength, rsi_val, price_spread, regime_key, spread_thresh = evaluate_regime_and_direction(
                     st.session_state["price_history"], selected_index
@@ -791,7 +794,7 @@ if "access_token" in st.session_state:
                 st.session_state["last_processed_closed_ts"] = bar_identifier
 
             except Exception as exc:
-                st.error(f"Closed-bar processing error on {bar_identifier}: {str(exc)}")
+                st.error(f"Evaluation error on {bar_identifier}: {str(exc)}")
 
         if is_new_closed_bar and bar_to_evaluate is not None:
             quote_age_ms = (time.time() - live_quote.timestamp) * 1000.0 if live_quote is not None else None
