@@ -75,6 +75,16 @@ if "cached_itm_candidate" not in st.session_state:
 if "cached_pcr" not in st.session_state:
     st.session_state["cached_pcr"] = 1.0
 
+# Daily Signal Counters & Auto-Reset State
+if "daily_call_count" not in st.session_state:
+    st.session_state["daily_call_count"] = 0
+if "daily_put_count" not in st.session_state:
+    st.session_state["daily_put_count"] = 0
+if "counter_date" not in st.session_state:
+    st.session_state["counter_date"] = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+if "last_counted_action" not in st.session_state:
+    st.session_state["last_counted_action"] = None
+
 def save_token_to_file(token_data):
     with open(TOKEN_FILE, "w") as f:
         json.dump(token_data, f)
@@ -254,11 +264,18 @@ if not active_expiry:
     active_expiry = target_expiry.strftime("%Y-%m-%d")
     expiry_status = "AUTO_RESOLVED"
 
-# ================= SIDEBAR CONTROLS (10:30 AM CUTOFF LOGIC) =================
+# ================= SIDEBAR CONTROLS & DAILY AUTO-RESET =================
 now_ist = datetime.datetime.now(IST)
 current_date_str = now_ist.strftime("%d %b %Y")
 current_time_str = now_ist.strftime("%I:%M:%S %p")
 today_iso = now_ist.strftime("%Y-%m-%d")
+
+# Daily Auto-Reset: Naye din par Call/Put counter 0 par reset hoga
+if st.session_state["counter_date"] != today_iso:
+    st.session_state["daily_call_count"] = 0
+    st.session_state["daily_put_count"] = 0
+    st.session_state["counter_date"] = today_iso
+    st.session_state["last_counted_action"] = None
 
 cutoff_time = datetime.time(10, 30, 0)
 is_after_cutoff = now_ist.time() >= cutoff_time
@@ -397,13 +414,6 @@ def calculate_realized_volatility(price_history):
     return round(max(8.0, min(annualized_vol, 35.0)), 2)
 
 def evaluate_regime_and_direction(price_history, selected_index, pcr_val=1.0):
-    """
-    10-Point Advanced Predictive Fusion Model:
-    1. EMA Slope Vector (Curve angle detection)
-    2. Tick Acceleration & Micro-Momentum
-    3. RSI Dynamic Velocity
-    4. Derivatives Flow (PCR Confluence)
-    """
     threshold_range = INDEX_CONFIG[selected_index]["sideways_range"]
     if len(price_history) < 15:
         return MarketDirection.NEUTRAL, 0, 0.0, 50.0, 0.0, "INSUFFICIENT_DATA", threshold_range, "NEUTRAL", 0.0
@@ -435,31 +445,26 @@ def evaluate_regime_and_direction(price_history, selected_index, pcr_val=1.0):
     bull_score = 0.0
     bear_score = 0.0
 
-    # Criterion A: EMA Cross & Alignment (2.0 Pts)
     if ema5_now > ema15_now:
         bull_score += 2.0
     elif ema5_now < ema15_now:
         bear_score += 2.0
 
-    # Criterion B: Predictive EMA Slope Angle (2.5 Pts)
     if ema_slope_pct > 0.15:
         bull_score += 2.5
     elif ema_slope_pct < -0.15:
         bear_score += 2.5
 
-    # Criterion C: Micro-Acceleration Thrust (2.5 Pts)
     if accel_pct > 0.035:
         bull_score += 2.5
     elif accel_pct < -0.035:
         bear_score += 2.5
 
-    # Criterion D: RSI Dynamic Boundary (1.5 Pts)
     if rsi >= 56.0:
         bull_score += 1.5
     elif rsi <= 44.0:
         bear_score += 1.5
 
-    # Criterion E: Institutional PCR Alignment (1.5 Pts)
     if pcr_val > 1.10:
         bull_score += 1.5
     elif pcr_val < 0.90:
@@ -469,7 +474,6 @@ def evaluate_regime_and_direction(price_history, selected_index, pcr_val=1.0):
     pre_alert_dir = "NEUTRAL"
     pre_alert_acc = 0.0
 
-    # Pre-Alert Trigger Threshold: >= 6.5 Points (Fast early warning)
     if bull_score >= 6.5 and bull_score > bear_score:
         pre_alert_dir = "BULLISH"
         pre_alert_acc = round(min(94.0, 75.0 + (bull_score / TOTAL_POINTS) * 20.0), 1)
@@ -477,7 +481,6 @@ def evaluate_regime_and_direction(price_history, selected_index, pcr_val=1.0):
         pre_alert_dir = "BEARISH"
         pre_alert_acc = round(min(94.0, 75.0 + (bear_score / TOTAL_POINTS) * 20.0), 1)
 
-    # Final Execution Signal Direction: >= 7.5 Points (High Conviction)
     if bull_score >= 7.5 and bull_score >= (bear_score + 3.0):
         trend_strength = (bull_score / TOTAL_POINTS) * 100.0
         return MarketDirection.BULLISH, int(round(bull_score)), trend_strength, rsi, price_spread, "TRENDING_BULLISH", threshold_range, pre_alert_dir, pre_alert_acc
@@ -570,10 +573,30 @@ with col_avatar:
         st.image(resolved_img_path, width=155)
 
 is_armed_simulation = "🟡 ARMED" in trade_mode
+
+# ================= MODE STRIP WITH LIVE DAILY CALL & PUT COUNTERS =================
+call_cnt = st.session_state["daily_call_count"]
+put_cnt = st.session_state["daily_put_count"]
+
+mode_strip_html = f"""
+<div style="background-color:#0e2a47; border:1px solid #1a4971; border-radius:8px; padding:10px 16px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
+    <div style="color:#64b5f6; font-size:13px; font-weight:600; display:flex; align-items:center; gap:8px;">
+        <span>ℹ️</span> <span>WATCH & SIGNAL MODE ACTIVE: Zero-Trust Safety Gate strictly enforced.</span>
+    </div>
+    <div style="display:flex; gap:12px; align-items:center;">
+        <span style="background-color:#163828; border:1px solid #2ecc71; color:#2ecc71; border-radius:6px; padding:3px 10px; font-size:12px; font-weight:700;">
+            🟢 CALL: {call_cnt}
+        </span>
+        <span style="background-color:#381c1c; border:1px solid #e74c3c; color:#ff6b6b; border-radius:6px; padding:3px 10px; font-size:12px; font-weight:700;">
+            🔴 PUT: {put_cnt}
+        </span>
+    </div>
+</div>
+"""
+st.markdown(mode_strip_html, unsafe_allow_html=True)
+
 if is_armed_simulation:
     st.warning("⚠️ **ARMED SIMULATION MONITOR:** Signal logic is live with broker data verification (Execution isolated).")
-else:
-    st.info("ℹ️ **WATCH & SIGNAL MODE ACTIVE:** Zero-Trust Safety Gate strictly enforced.")
 
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
@@ -817,6 +840,15 @@ if "access_token" in st.session_state:
                                         if passed_gate:
                                             final_action = f"BUY {best_candidate['option_type'].value}"
                                             action_color = "#ff4b4b" if best_candidate["option_type"] == OptionType.PE else "#2ecc71"
+                                            
+                                            # Distinct Daily Counting: Ek bar/signal par count sirf 1 baar badhega
+                                            action_unique_key = f"{bar_identifier}_{final_action}"
+                                            if st.session_state["last_counted_action"] != action_unique_key:
+                                                if best_candidate["option_type"] == OptionType.CE:
+                                                    st.session_state["daily_call_count"] += 1
+                                                elif best_candidate["option_type"] == OptionType.PE:
+                                                    st.session_state["daily_put_count"] += 1
+                                                st.session_state["last_counted_action"] = action_unique_key
                                         else:
                                             final_action = "NO TRADE"
                                             action_color = "#f1c40f"
