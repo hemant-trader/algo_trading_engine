@@ -23,8 +23,8 @@ from engine.contract_verifier import ContractIdentityAuthority
 from engine.live_execution_quote_provider import LiveExecutionQuoteProvider
 from engine.telemetry_logger import HeadlessObservationLogger
 
-# Wire Hardened Institutional Core Engine
-from engine_orchestrator import EngineOrchestrator
+# Wire Hardened Institutional Core Engine with Fail-Closed OI Gate
+from engine_core import EngineOrchestrator
 
 st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 
@@ -47,7 +47,7 @@ if "selected_index" not in st.session_state:
 if "price_history" not in st.session_state:
     st.session_state["price_history"] = []
 if "engine_orch" not in st.session_state:
-    st.session_state["engine_orch"] = EngineOrchestrator()
+    st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
 if "candidate_tracker" not in st.session_state:
     st.session_state["candidate_tracker"] = CandidateHysteresisTracker(hysteresis_delta=5.0, flip_cooldown_seconds=12.0)
 if "candidate_scanner" not in st.session_state:
@@ -62,12 +62,6 @@ if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=int(INITIAL_TTL_ESTIMATE))
 if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
-
-# Predictive Pre-Alert & Metrics Cache
-if "cached_itm_candidate" not in st.session_state:
-    st.session_state["cached_itm_candidate"] = None
-if "cached_pcr" not in st.session_state:
-    st.session_state["cached_pcr"] = 1.0
 
 # Daily Signal Counters
 if "daily_call_count" not in st.session_state:
@@ -204,7 +198,7 @@ if st.session_state["counter_date"] != today_iso:
     st.session_state["daily_put_count"] = 0
     st.session_state["counter_date"] = today_iso
     st.session_state["last_counted_action"] = None
-    st.session_state["engine_orch"] = EngineOrchestrator()
+    st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
 
 cutoff_time = datetime.time(10, 30, 0)
 is_after_cutoff = now_ist.time() >= cutoff_time
@@ -261,8 +255,7 @@ if selected_index != st.session_state["selected_index"]:
     st.session_state["price_history"] = []
     st.session_state["candidate_tracker"].flush()
     st.session_state["expiry_manager"].flush_cache()
-    st.session_state["engine_orch"] = EngineOrchestrator()
-    st.session_state["cached_itm_candidate"] = None
+    st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
     st.rerun()
 
 st.sidebar.markdown("---")
@@ -296,7 +289,7 @@ else:
         st.session_state["price_history"] = []
         st.session_state["candidate_tracker"].flush()
         st.session_state["expiry_manager"].flush_cache()
-        st.session_state["engine_orch"] = EngineOrchestrator()
+        st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
         st.rerun()
 
 # ================= TOP AVATAR BAR =================
@@ -363,13 +356,23 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 50:
             st.session_state["price_history"].pop(0)
 
-        # ----------------------------------------------------
-        # FEED LIVE TICK TO ENGINE ORCHESTRATOR
-        # ----------------------------------------------------
         orch = st.session_state["engine_orch"]
+
+        # 1. OPTION CHAIN SNAPSHOT -> FAIL-CLOSED OI CONFIRMATION GATE
+        chain_data = None
+        oi_diag = {"status": "INITIALIZING", "pcr": 1.0, "reason": "AWAITING_CHAIN"}
+        if active_expiry:
+            chain_data = get_option_chain_data(inst_key, active_expiry, token)
+            if chain_data:
+                oi_diag = orch.update_option_chain_snapshot(
+                    snapshot_time=now_ist,
+                    underlying_price=spot_ltp,
+                    chain_data=chain_data,
+                    wall_time=now_ist
+                )
+
+        # 2. FEED LIVE TICK TO ENGINE ORCHESTRATOR
         orch_output = orch.process_tick(spot_ltp, now_ist)
-        
-        # Boundary finalization for completed candles
         boundary_event = orch.finalize_boundary(now_ist)
         active_event = boundary_event or orch_output.get("event")
 
@@ -379,7 +382,7 @@ if "access_token" in st.session_state:
         macro_trend = active_event["macro"] if active_event else "STANDBY"
         cooldown_left = active_event["cooldown"] if active_event else 0
 
-        # Map Engine Consensus to MarketDirection
+        # Market Direction Mapping
         if raw_engine_action == "BUY CE" or macro_trend == "BULLISH":
             market_dir = MarketDirection.BULLISH
         elif raw_engine_action == "BUY PE" or macro_trend == "BEARISH":
@@ -387,71 +390,77 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
+        # 3. CONTINUOUS OTM STRIKE SCANNER (Always monitors nearest liquid strike)
         best_candidate = None
         scan_diag = {}
+        if chain_data:
+            scan_dir = market_dir if market_dir != MarketDirection.NEUTRAL else MarketDirection.BULLISH
+            best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
+                chain_data=chain_data,
+                direction=scan_dir,
+                trend_score=75.0
+            )
+
         passed_gate = False
         final_action = "NO TRADE"
         gate_msg = engine_status
 
-        # If Engine permits trade, engage scanner and safety gate
-        if raw_engine_action in ("BUY CE", "BUY PE") and active_expiry:
-            chain_data = get_option_chain_data(inst_key, active_expiry, token)
-            if chain_data:
-                best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
-                    chain_data=chain_data,
+        # 4. ZERO-TRUST SAFETY GATE (Executes when Engine triggers BUY CE/PE)
+        if raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data:
+            target_cand, _ = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
+                chain_data=chain_data,
+                direction=market_dir,
+                trend_score=85.0
+            )
+            if target_cand:
+                cand_sym = f"{selected_index.replace(' ', '')}_{target_cand['symbol']}"
+                cand_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
+                    symbol=cand_sym,
+                    strike=target_cand["strike"],
+                    option_type=target_cand["option_type"],
+                    score=target_cand["score"],
                     direction=market_dir,
-                    trend_score=85.0
+                    bar_timestamp=now_ist.strftime("%H:%M:%S"),
+                    is_new_closed_bar=True,
+                    required_confirmations=2
                 )
-                if best_candidate:
-                    cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-                    cand_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                        symbol=cand_sym,
-                        strike=best_candidate["strike"],
-                        option_type=best_candidate["option_type"],
-                        score=best_candidate["score"],
-                        direction=market_dir,
-                        bar_timestamp=now_ist.strftime("%H:%M:%S"),
-                        is_new_closed_bar=True,
-                        required_confirmations=2
-                    )
 
-                    exact_tte = calculate_precise_tte(active_expiry)
-                    live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
-                        instrument_key=best_candidate["instrument_key"],
-                        symbol=cand_sym,
-                        underlying=selected_index,
-                        underlying_spot=spot_ltp,
-                        expiry=active_expiry,
-                        strike=best_candidate["strike"],
-                        option_type=best_candidate["option_type"],
-                        token=token,
-                        tte=exact_tte,
-                        seq_no=current_seq,
-                        iv_decimal=best_candidate["iv_decimal"]
-                    )
+                exact_tte = calculate_precise_tte(active_expiry)
+                live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
+                    instrument_key=target_cand["instrument_key"],
+                    symbol=cand_sym,
+                    underlying=selected_index,
+                    underlying_spot=spot_ltp,
+                    expiry=active_expiry,
+                    strike=target_cand["strike"],
+                    option_type=target_cand["option_type"],
+                    token=token,
+                    tte=exact_tte,
+                    seq_no=current_seq,
+                    iv_decimal=target_cand["iv_decimal"]
+                )
 
-                    if live_quote:
-                        bs_greeks = BlackScholesEngine.calculate_greeks(
-                            spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
-                        )
-                        passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
-                            market_direction=market_dir,
-                            tick=live_quote,
-                            greeks=bs_greeks,
-                            candidate=cand_state,
-                            candidate_ready=is_ready,
-                            ttl_state=st.session_state["ttl_manager"]
-                        )
-                        if passed_gate:
-                            final_action = raw_engine_action
-                            # Count unique daily signals
-                            unique_key = f"{now_ist.strftime('%Y%m%d_%H%M')}_{final_action}"
-                            if st.session_state["last_counted_action"] != unique_key:
-                                if "CE" in final_action:
-                                    st.session_state["daily_call_count"] += 1
-                                else:
-                                    st.session_state["daily_put_count"] += 1
-                                st.session_state["last_counted_action"] = unique_key
+                if live_quote:
+                    bs_greeks = BlackScholesEngine.calculate_greeks(
+                        spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
+                    )
+                    passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
+                        market_direction=market_dir,
+                        tick=live_quote,
+                        greeks=bs_greeks,
+                        candidate=cand_state,
+                        candidate_ready=is_ready,
+                        ttl_state=st.session_state["ttl_manager"]
+                    )
+                    if passed_gate:
+                        final_action = raw_engine_action
+                        unique_key = f"{now_ist.strftime('%Y%m%d_%H%M')}_{final_action}"
+                        if st.session_state["last_counted_action"] != unique_key:
+                            if "CE" in final_action:
+                                st.session_state["daily_call_count"] += 1
+                            else:
+                                st.session_state["daily_put_count"] += 1
+                            st.session_state["last_counted_action"] = unique_key
 
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
@@ -459,7 +468,11 @@ if "access_token" in st.session_state:
         with col_metric:
             regime_title = f"TRENDING ({market_dir.value})" if market_dir != MarketDirection.NEUTRAL else "SIDEWAYS / CHOPPY"
             regime_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else ("#e74c3c" if market_dir == MarketDirection.BEARISH else "#e67e22")
-            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})" if best_candidate else "NONE"
+            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})" if best_candidate else "SCANNING..."
+
+            pcr_display = f"{oi_diag.get('pcr', 1.0):.2f}" if oi_diag.get('pcr') else "1.00"
+            oi_status = oi_diag.get("status", "STANDBY")
+            oi_status_color = "#2ecc71" if "BULLISH" in oi_status else ("#e74c3c" if "BEARISH" in oi_status else "#f1c40f")
 
             st.markdown(f"""
             <div style="background-color:#161f30; padding:14px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">
@@ -468,11 +481,12 @@ if "access_token" in st.session_state:
                     <div style="color:{regime_color}; font-size:15px; font-weight:bold; margin-top:2px;">⏳ {regime_title}</div></div>
                     <div style="text-align:center;"><span style="color:#8892b0; font-size:11px;">MACRO CONFLUENCE</span>
                     <div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{macro_trend}</div></div>
-                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST CANDIDATE</span>
+                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST OTM CANDIDATE</span>
                     <div style="color:#64ffda; font-size:13px; font-weight:bold; margin-top:2px;">{best_opt_display}</div></div>
                 </div>
-                <div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px;">
-                    ℹ️ Cooldown Remaining: <b>{cooldown_left} bars</b> | Aggregated Bars: 1m={len(orch.agg.bars_1m)}, 5m={len(orch.agg.bars_5m)}, 15m={len(orch.agg.bars_15m)}
+                <div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px; display:flex; justify-content:space-between;">
+                    <span>ℹ️ Cooldown: <b>{cooldown_left} bars</b> | Bars: 1m={len(orch.agg.bars_1m)}, 5m={len(orch.agg.bars_5m)}, 15m={len(orch.agg.bars_15m)}</span>
+                    <span>OI Gate: <b style="color:{oi_status_color};">{oi_status}</b> (PCR: <b>{pcr_display}</b>)</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
