@@ -463,75 +463,97 @@ if "access_token" in st.session_state:
 
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 16.50
 
+        # 4. DYNAMIC ADAPTIVE CONFIRMATION RULES (Fast = 2, Slow = 3)
+        is_fast_momentum = (rsi_14 >= 60.0 or rsi_14 <= 40.0) or (realized_vol >= 15.0)
+        required_confirmations = 2 if is_fast_momentum else 3
+
         passed_gate = False
         final_action = "NO TRADE"
         gate_msg = engine_status
+        cand_state = None
+        is_candidate_ready = False
 
-        # 4. ZERO-TRUST SAFETY GATE (Executes when Engine triggers BUY CE/PE)
-        if raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data:
-            target_cand, _ = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
-                chain_data=chain_data,
-                direction=market_dir,
-                trend_score=85.0
+        # Pre-Alert & Execution Evaluation
+        if best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
+            cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+            cand_state, is_candidate_ready = st.session_state["candidate_tracker"].process_candidate(
+                symbol=cand_sym,
+                strike=best_candidate["strike"],
+                option_type=best_candidate["option_type"],
+                score=best_candidate["score"],
+                direction=market_dir if market_dir != MarketDirection.NEUTRAL else MarketDirection.BULLISH,
+                bar_timestamp=now_ist.strftime("%H:%M:%S"),
+                is_new_closed_bar=True,
+                required_confirmations=required_confirmations
             )
-            if target_cand:
-                cand_sym = f"{selected_index.replace(' ', '')}_{target_cand['symbol']}"
-                cand_state, is_ready = st.session_state["candidate_tracker"].process_candidate(
-                    symbol=cand_sym,
-                    strike=target_cand["strike"],
-                    option_type=target_cand["option_type"],
-                    score=target_cand["score"],
-                    direction=market_dir,
-                    bar_timestamp=now_ist.strftime("%H:%M:%S"),
-                    is_new_closed_bar=True,
-                    required_confirmations=2
-                )
 
-                exact_tte = calculate_precise_tte(active_expiry)
-                live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
-                    instrument_key=target_cand["instrument_key"],
-                    symbol=cand_sym,
-                    underlying=selected_index,
-                    underlying_spot=spot_ltp,
-                    expiry=active_expiry,
-                    strike=target_cand["strike"],
-                    option_type=target_cand["option_type"],
-                    token=token,
-                    tte=exact_tte,
-                    seq_no=current_seq,
-                    iv_decimal=target_cand["iv_decimal"]
-                )
+        # 5. ZERO-TRUST SAFETY GATE (Executes when Engine triggers BUY CE/PE)
+        if raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
+            cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+            exact_tte = calculate_precise_tte(active_expiry)
+            live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
+                instrument_key=best_candidate["instrument_key"],
+                symbol=cand_sym,
+                underlying=selected_index,
+                underlying_spot=spot_ltp,
+                expiry=active_expiry,
+                strike=best_candidate["strike"],
+                option_type=best_candidate["option_type"],
+                token=token,
+                tte=exact_tte,
+                seq_no=current_seq,
+                iv_decimal=best_candidate["iv_decimal"]
+            )
 
-                if live_quote:
-                    bs_greeks = BlackScholesEngine.calculate_greeks(
-                        spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
-                    )
-                    passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
-                        market_direction=market_dir,
-                        tick=live_quote,
-                        greeks=bs_greeks,
-                        candidate=cand_state,
-                        candidate_ready=is_ready,
-                        ttl_state=st.session_state["ttl_manager"]
-                    )
-                    if passed_gate:
-                        final_action = raw_engine_action
-                        unique_key = f"{now_ist.strftime('%Y%m%d_%H%M')}_{final_action}"
-                        if st.session_state["last_counted_action"] != unique_key:
-                            if "CE" in final_action:
-                                st.session_state["daily_call_count"] += 1
-                            else:
-                                st.session_state["daily_put_count"] += 1
-                            st.session_state["last_counted_action"] = unique_key
+            if live_quote:
+                bs_greeks = BlackScholesEngine.calculate_greeks(
+                    spot_ltp, live_quote.strike, live_quote.tte, 0.07, live_quote.iv, live_quote.option_type
+                )
+                passed_gate, gate_msg = ZeroTrustFinalSafetyGate.verify_execution(
+                    market_direction=market_dir,
+                    tick=live_quote,
+                    greeks=bs_greeks,
+                    candidate=cand_state,
+                    candidate_ready=is_candidate_ready,
+                    ttl_state=st.session_state["ttl_manager"]
+                )
+                if passed_gate:
+                    final_action = raw_engine_action
+                    unique_key = f"{now_ist.strftime('%Y%m%d_%H%M')}_{final_action}"
+                    if st.session_state["last_counted_action"] != unique_key:
+                        if "CE" in final_action:
+                            st.session_state["daily_call_count"] += 1
+                        else:
+                            st.session_state["daily_put_count"] += 1
+                        st.session_state["last_counted_action"] = unique_key
 
         # ================= STRIKE REVEAL POLICY =================
-        # Strike & contract price are strictly concealed until a valid signal is generated
         if raw_engine_action in ("BUY CE", "BUY PE") and best_candidate:
+            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
+            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+        elif market_dir != MarketDirection.NEUTRAL and best_candidate:
             best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
             tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
         else:
             best_opt_display = "AWAITING SIGNAL..."
             tracked_contract = "AWAITING SIGNAL..."
+
+        # ================= ACCURATE DYNAMIC STABILITY LOGIC =================
+        current_confirmations = cand_state.confirmations if cand_state else 0
+        speed_tag = "Fast" if is_fast_momentum else "Slow"
+
+        if raw_engine_action in ("BUY CE", "BUY PE") and is_candidate_ready:
+            stability_str = f"{current_confirmations}/{required_confirmations} Confirmed (Active - {speed_tag})"
+            stability_color = "#2ecc71"
+        elif raw_engine_action in ("BUY CE", "BUY PE"):
+            stability_str = f"{current_confirmations}/{required_confirmations} Confirming ({speed_tag} Move)"
+            stability_color = "#f1c40f"
+        elif market_dir != MarketDirection.NEUTRAL:
+            stability_str = f"{current_confirmations}/{required_confirmations} Tracking (Pre-Alert - {speed_tag})"
+            stability_color = "#64ffda"
+        else:
+            stability_str = f"0/{required_confirmations} Standby (No Signal)"
+            stability_color = "#848d9c"
 
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
@@ -621,9 +643,6 @@ if "access_token" in st.session_state:
             gate_badge = "PASSED" if passed_gate else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
-            # Stability tracking text
-            stability_str = "2/2 Confirmed (Active)" if st.session_state["ttl_manager"].is_alive() else "Awaiting Sync"
-
             # Dynamic Score calculation
             score_val = 85.0 if market_dir != MarketDirection.NEUTRAL else 45.0
             score_ratio = "8/10" if market_dir != MarketDirection.NEUTRAL else "4/10"
@@ -645,7 +664,7 @@ if "access_token" in st.session_state:
                 <div style="font-size:12px; line-height:1.7;">
                     <div style="color:#ccd6f6;">Consensus: <b style="color:#ffffff;">{macro_trend}</b></div>
                     <div style="color:#ccd6f6;">Tracked Contract: <b style="color:#2ecc71;">{tracked_contract}</b></div>
-                    <div style="color:#64ffda; font-size:11px;">Stability: <b>{stability_str}</b></div>
+                    <div style="color:{stability_color}; font-size:11px;">Stability: <b>{stability_str}</b></div>
                     <div style="color:#848d9c; font-size:11px; margin-top:4px;">Gate Info: {gate_msg}</div>
                 </div>
             </div>
