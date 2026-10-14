@@ -450,7 +450,7 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
-        # 3. INTERNAL STRIKE EVALUATION
+        # 3. INTERNAL STRIKE EVALUATION & DELTA EXTRACTION
         best_candidate = None
         scan_diag = {}
         if chain_data:
@@ -462,6 +462,7 @@ if "access_token" in st.session_state:
             )
 
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 16.50
+        raw_cand_delta = best_candidate.get("abs_delta", 0.0) if best_candidate else 0.0
 
         # 4. DYNAMIC ADAPTIVE CONFIRMATION RULES (Fast = 2, Slow = 3)
         is_fast_momentum = (rsi_14 >= 60.0 or rsi_14 <= 40.0) or (realized_vol >= 15.0)
@@ -473,7 +474,7 @@ if "access_token" in st.session_state:
         cand_state = None
         is_candidate_ready = False
 
-        # Pre-Alert & Execution Evaluation
+        # Pre-Alert & Execution Tracking
         if best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             cand_state, is_candidate_ready = st.session_state["candidate_tracker"].process_candidate(
@@ -555,6 +556,14 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
+        # Delta Display Formatting for Horizontal Strip
+        if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
+            delta_display_str = f"{raw_cand_delta:.2f}"
+            delta_display_color = "#2ecc71"
+        else:
+            delta_display_str = "--"
+            delta_display_color = "#848d9c"
+
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
 
@@ -605,47 +614,63 @@ if "access_token" in st.session_state:
             </div>
             """, unsafe_allow_html=True)
 
-            # 6-COLUMN BALANCED METRICS STRIP
+            # 7-COLUMN UNIFIED METRICS STRIP (WITH DELTA COLUMN)
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
-                f'<div style="flex: 1.2; border-right: 1px solid #233554; padding-right: 6px;">'
+                f'<div style="flex: 1.1; border-right: 1px solid #233554; padding-right: 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">{selected_index} Spot</div>'
-                f'<div style="color:#ffffff; font-size:18px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>'
+                f'<div style="color:#ffffff; font-size:17px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>'
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">RSI (14)</div>'
-                f'<div style="color:#64ffda; font-size:18px; font-weight:700; margin-top:2px;">{rsi_14:.1f}</div>'
+                f'<div style="color:#64ffda; font-size:17px; font-weight:700; margin-top:2px;">{rsi_14:.1f}</div>'
                 f'</div>'
-                f'<div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
+                f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
+                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Delta (Δ)</div>'
+                f'<div style="color:{delta_display_color}; font-size:17px; font-weight:700; margin-top:2px;">{delta_display_str}</div>'
+                f'</div>'
+                f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Option IV</div>'
-                f'<div style="color:#ccd6f6; font-size:18px; font-weight:700; margin-top:2px;">{current_iv_pct:.1f}%</div>'
-                f'</div>'
-                f'<div style="flex: 1.0; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
-                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Realized Vol</div>'
-                f'<div style="color:#ccd6f6; font-size:18px; font-weight:700; margin-top:2px;">{realized_vol:.1f}%</div>'
+                f'<div style="color:#ccd6f6; font-size:17px; font-weight:700; margin-top:2px;">{current_iv_pct:.1f}%</div>'
                 f'</div>'
                 f'<div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
-                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Cooldown</div>'
-                f'<div style="color:#f1c40f; font-size:18px; font-weight:700; margin-top:2px;">{cooldown_left} BARS</div>'
+                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Realized Vol</div>'
+                f'<div style="color:#ccd6f6; font-size:17px; font-weight:700; margin-top:2px;">{realized_vol:.1f}%</div>'
                 f'</div>'
-                f'<div style="flex: 1.2; text-align:right; padding-left: 6px;">'
+                f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
+                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Cooldown</div>'
+                f'<div style="color:#f1c40f; font-size:17px; font-weight:700; margin-top:2px;">{cooldown_left} BARS</div>'
+                f'</div>'
+                f'<div style="flex: 1.1; text-align:right; padding-left: 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Engine State</div>'
-                f'<div style="color:#64ffda; font-size:13px; font-weight:700; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{engine_status[:15]}</div>'
+                f'<div style="color:#64ffda; font-size:12px; font-weight:700; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{engine_status[:15]}</div>'
                 f'</div>'
                 f'</div>'
             )
             st.markdown(metrics_strip_html, unsafe_allow_html=True)
             st.line_chart(pd.DataFrame(st.session_state["price_history"], columns=["Spot Price"]))
 
-        # ================= SIGNAL CARD (AUTHENTIC PHOTO LAYOUT) =================
+        # ================= SIGNAL CARD =================
         with col_signal_card:
             action_color = "#2ecc71" if "CE" in final_action else ("#e74c3c" if "PE" in final_action else "#f1c40f")
             gate_badge = "PASSED" if passed_gate else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
-            # Dynamic Score calculation
-            score_val = 85.0 if market_dir != MarketDirection.NEUTRAL else 45.0
-            score_ratio = "8/10" if market_dir != MarketDirection.NEUTRAL else "4/10"
+            # Trend Score strictly locked to confirmed signal or active pre-alert
+            if raw_engine_action in ("BUY CE", "BUY PE"):
+                score_ratio = "8/10"
+                score_val = 85.0
+                score_color = "#2ecc71"
+            elif market_dir != MarketDirection.NEUTRAL:
+                score_ratio = "6/10"
+                score_val = 65.0
+                score_color = "#f1c40f"
+            else:
+                score_ratio = "--/10"
+                score_val = 0.0
+                score_color = "#848d9c"
+
+            score_text = f"{score_ratio} ({score_val:.1f}%)" if score_val > 0 else "--/10 (0.0%)"
 
             st.markdown(f"""
             <div style="background-color:#1e222d; padding:20px 16px; border-radius:12px; text-align:center; border:1px solid #363c4e;">
@@ -654,7 +679,7 @@ if "access_token" in st.session_state:
                 <div style="display:flex; justify-content:center; gap:12px; margin-bottom:14px;">
                     <div style="background-color:#14171f; padding:6px 14px; border-radius:6px; border:1px solid #2a2e39; min-width:110px;">
                         <span style="color:#848d9c; font-size:11px;">Trend Score</span><br>
-                        <b style="color:#2ecc71; font-size:13px;">{score_ratio} ({score_val:.1f}%)</b>
+                        <b style="color:{score_color}; font-size:13px;">{score_text}</b>
                     </div>
                     <div style="background-color:#14171f; padding:6px 14px; border-radius:6px; border:1px solid #2a2e39; min-width:110px;">
                         <span style="color:#848d9c; font-size:11px;">Safety Gate</span><br>
