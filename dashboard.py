@@ -450,7 +450,7 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
-        # 3. CONTINUOUS OTM STRIKE SCANNER
+        # 3. INTERNAL STRIKE EVALUATION
         best_candidate = None
         scan_diag = {}
         if chain_data:
@@ -524,6 +524,15 @@ if "access_token" in st.session_state:
                                 st.session_state["daily_put_count"] += 1
                             st.session_state["last_counted_action"] = unique_key
 
+        # ================= STRIKE REVEAL POLICY =================
+        # Strike & contract price are strictly concealed until a valid signal is generated
+        if raw_engine_action in ("BUY CE", "BUY PE") and best_candidate:
+            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
+            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+        else:
+            best_opt_display = "AWAITING SIGNAL..."
+            tracked_contract = "AWAITING SIGNAL..."
+
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
 
@@ -531,7 +540,6 @@ if "access_token" in st.session_state:
             regime_title = f"TRENDING ({market_dir.value})" if market_dir != MarketDirection.NEUTRAL else "SIDEWAYS / CHOPPY"
             regime_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else ("#e74c3c" if market_dir == MarketDirection.BEARISH else "#e67e22")
             trend_focus = f"MOMENTUM {market_dir.value}" if market_dir != MarketDirection.NEUTRAL else "STANDBY / AVOID CHOP"
-            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})" if best_candidate else "SCANNING..."
 
             # PREDICTIVE PRE-ALERT BADGE
             if market_dir == MarketDirection.BULLISH:
@@ -564,7 +572,7 @@ if "access_token" in st.session_state:
                     <div style="color:{regime_color}; font-size:15px; font-weight:bold; margin-top:2px;">⏳ {regime_title}</div></div>
                     <div style="text-align:center;"><span style="color:#8892b0; font-size:11px;">TREND FOCUS</span>
                     <div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus}</div></div>
-                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST OTM CANDIDATE</span>
+                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST CANDIDATE</span>
                     <div style="color:#64ffda; font-size:13px; font-weight:bold; margin-top:2px;">{best_opt_display}</div></div>
                 </div>
                 {pre_alert_badge}
@@ -607,16 +615,13 @@ if "access_token" in st.session_state:
             st.markdown(metrics_strip_html, unsafe_allow_html=True)
             st.line_chart(pd.DataFrame(st.session_state["price_history"], columns=["Spot Price"]))
 
-        # ================= SIGNAL CARD (RESTORED TO ORIGINAL PHOTO LAYOUT) =================
+        # ================= SIGNAL CARD (AUTHENTIC PHOTO LAYOUT) =================
         with col_signal_card:
             action_color = "#2ecc71" if "CE" in final_action else ("#e74c3c" if "PE" in final_action else "#f1c40f")
             gate_badge = "PASSED" if passed_gate else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
-            # Dynamic Contract Symbol
-            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}" if best_candidate else "NONE"
-            
-            # Stability tracking text matching the original architecture
+            # Stability tracking text
             stability_str = "2/2 Confirmed (Active)" if st.session_state["ttl_manager"].is_alive() else "Awaiting Sync"
 
             # Dynamic Score calculation
