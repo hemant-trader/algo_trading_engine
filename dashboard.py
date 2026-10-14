@@ -306,7 +306,7 @@ with col_title:
     <div style="display:flex; align-items:center; gap:12px; padding:10px 0;">
         <span style="font-size:42px; line-height:1;">⚡</span>
         <h1 style="margin:0; font-size:38px; font-weight:900; line-height:1.1; letter-spacing:-0.5px;">
-            <span style="color:#ffffff;">Hemant </span><span style="color:#e74c3c;">Algo </span><span style="color:#ffffff;">Trading Engine</span>
+            <span style="color:#0f172a;">Hemant </span><span style="color:#e74c3c;">Algo </span><span style="color:#0f172a;">Trading Engine</span>
         </h1>
     </div>
     """, unsafe_allow_html=True)
