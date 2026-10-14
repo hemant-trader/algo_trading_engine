@@ -612,21 +612,30 @@ if "access_token" in st.session_state:
             gate_badge = "PASSED" if passed_gate else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
+            # Stability Calculation based on TTL pulse & API Latency
+            is_feed_live = st.session_state["ttl_manager"].is_alive()
+            stability_text = "STABLE" if (is_feed_live and api_latency < 1.0) else ("DEGRADED" if is_feed_live else "CRITICAL")
+            stability_color = "#2ecc71" if stability_text == "STABLE" else ("#f1c40f" if stability_text == "DEGRADED" else "#e74c3c")
+
             st.markdown(f"""
             <div style="background-color:#1e222d; padding:20px; border-radius:12px; text-align:center; border:1px solid #363c4e;">
                 <h3 style="color:#b2b9c7; margin-bottom:2px; font-size:18px;">⚡ Engine Signal ({selected_index})</h3>
                 <h1 style="color:{action_color}; font-size:32px; margin-top:2px; margin-bottom:12px; font-weight:bold;">{final_action}</h1>
-                <div style="display:flex; justify-content:space-around; margin-bottom:12px;">
-                    <div style="background-color:#14171f; padding:6px 12px; border-radius:6px; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:11px;">Consensus</span><br>
-                        <b style="color:#ffffff; font-size:14px;">{macro_trend}</b>
+                <div style="display:flex; justify-content:space-between; gap:6px; margin-bottom:12px;">
+                    <div style="flex:1; background-color:#14171f; padding:6px 4px; border-radius:6px; border:1px solid #2a2e39;">
+                        <span style="color:#848d9c; font-size:10px; text-transform:uppercase;">Consensus</span><br>
+                        <b style="color:#ffffff; font-size:13px;">{macro_trend}</b>
                     </div>
-                    <div style="background-color:#14171f; padding:6px 12px; border-radius:6px; border:1px solid #2a2e39;">
-                        <span style="color:#848d9c; font-size:11px;">Safety Gate</span><br>
-                        <b style="color:{gate_badge_color}; font-size:14px;">{gate_badge}</b>
+                    <div style="flex:1; background-color:#14171f; padding:6px 4px; border-radius:6px; border:1px solid #2a2e39;">
+                        <span style="color:#848d9c; font-size:10px; text-transform:uppercase;">Stability</span><br>
+                        <b style="color:{stability_color}; font-size:13px;">{stability_text}</b>
+                    </div>
+                    <div style="flex:1; background-color:#14171f; padding:6px 4px; border-radius:6px; border:1px solid #2a2e39;">
+                        <span style="color:#848d9c; font-size:10px; text-transform:uppercase;">Safety Gate</span><br>
+                        <b style="color:{gate_badge_color}; font-size:13px;">{gate_badge}</b>
                     </div>
                 </div>
-                <p style="color:#57606a; font-size:11px; margin-top:6px;">Gate Reason: {gate_msg}</p>
+                <p style="color:#57606a; font-size:11px; margin-top:6px; margin-bottom:0px;">Gate Reason: {gate_msg}</p>
             </div>
             """, unsafe_allow_html=True)
 
