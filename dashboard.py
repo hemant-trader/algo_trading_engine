@@ -62,6 +62,8 @@ if "ttl_manager" not in st.session_state:
     st.session_state["ttl_manager"] = PulseTTLStateMachine(max_ttl=int(INITIAL_TTL_ESTIMATE))
 if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
+if "bootstrapped_indices" not in st.session_state:
+    st.session_state["bootstrapped_indices"] = set()
 
 # Daily Signal Counters
 if "daily_call_count" not in st.session_state:
@@ -133,6 +135,30 @@ def get_option_chain_data(instrument_key, expiry_date, token):
     return None
 
 
+def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, token: str):
+    """Upstox API se aaj ke closed 1m bars fetch karke aggregator ko bootstrap karta hai."""
+    encoded_key = urllib.parse.quote(instrument_key)
+    today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}"
+    headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "success" and "data" in data and "candles" in data["data"]:
+                candles = data["data"]["candles"]
+                candles.reverse()  # Chronological order
+                for c in candles:
+                    ts = datetime.datetime.fromisoformat(c[0]).astimezone(IST)
+                    close_p = float(c[4])
+                    orch.process_tick(close_p, ts)
+                    orch.finalize_boundary(ts)
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def calculate_precise_tte(expiry_str):
     try:
         now_ist = datetime.datetime.now(IST)
@@ -145,15 +171,15 @@ def calculate_precise_tte(expiry_str):
 
 
 def calculate_realized_volatility(price_history):
-    if len(price_history) < 5:
-        return 12.85
+    if len(price_history) < 14:
+        return 0.0
     s = pd.Series(price_history)
     log_returns = np.log(s / s.shift(1)).dropna()
     std = log_returns.std()
     if np.isnan(std) or std == 0:
-        return 12.85
+        return 0.0
     annualized_vol = float(std * np.sqrt(252 * 375 * 12) * 100.0)
-    return round(max(8.0, min(annualized_vol, 35.0)), 2)
+    return round(max(5.0, min(annualized_vol, 45.0)), 2)
 
 
 saved_token_data = load_token_from_file()
@@ -258,6 +284,7 @@ if st.session_state["counter_date"] != today_iso:
     st.session_state["counter_date"] = today_iso
     st.session_state["last_counted_action"] = None
     st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
+    st.session_state["bootstrapped_indices"].clear()
 
 cutoff_time = datetime.time(10, 30, 0)
 is_after_cutoff = now_ist.time() >= cutoff_time
@@ -349,6 +376,7 @@ else:
         st.session_state["candidate_tracker"].flush()
         st.session_state["expiry_manager"].flush_cache()
         st.session_state["engine_orch"] = EngineOrchestrator(mandatory_oi_gate=True)
+        st.session_state["bootstrapped_indices"].clear()
         st.rerun()
 
 # ================= TOP AVATAR BAR =================
@@ -390,7 +418,14 @@ st.markdown(f"""
 if "access_token" in st.session_state:
     inst_key = INDEX_CONFIG[selected_index]["key"]
     token = st.session_state["access_token"]
-    
+    orch = st.session_state["engine_orch"]
+
+    # 1. ONE-TIME HISTORICAL BOOTSTRAP TO PREVENT BAR FREEZE
+    if selected_index not in st.session_state["bootstrapped_indices"]:
+        bootstrapped = bootstrap_historical_candles(orch, inst_key, token)
+        if bootstrapped:
+            st.session_state["bootstrapped_indices"].add(selected_index)
+
     t_start = time.time()
     quote_data = get_market_quote(inst_key, token)
     api_latency = max(0.1, time.time() - t_start)
@@ -412,15 +447,14 @@ if "access_token" in st.session_state:
         current_seq = st.session_state["seq_counter"]
 
         st.session_state["price_history"].append(spot_ltp)
-        if len(st.session_state["price_history"]) > 50:
+        if len(st.session_state["price_history"]) > 100:
             st.session_state["price_history"].pop(0)
 
         realized_vol = calculate_realized_volatility(st.session_state["price_history"])
-        orch = st.session_state["engine_orch"]
 
-        # 1. OPTION CHAIN SNAPSHOT -> FAIL-CLOSED OI CONFIRMATION GATE
+        # 2. OPTION CHAIN SNAPSHOT WITH FAIL-CLOSED STALE CHECK
         chain_data = None
-        oi_diag = {"status": "INITIALIZING", "pcr": 1.0, "reason": "AWAITING_CHAIN"}
+        oi_diag = {"status": "INITIALIZING", "pcr": None, "reason": "AWAITING_CHAIN"}
         if active_expiry:
             chain_data = get_option_chain_data(inst_key, active_expiry, token)
             if chain_data:
@@ -430,15 +464,19 @@ if "access_token" in st.session_state:
                     chain_data=chain_data,
                     wall_time=now_ist
                 )
+            else:
+                oi_diag = {"status": "DATA_UNAVAILABLE", "pcr": None, "reason": "CHAIN_FETCH_FAILED"}
 
-        # 2. FEED LIVE TICK TO ENGINE ORCHESTRATOR
+        # 3. FEED LIVE TICK TO ENGINE ORCHESTRATOR
         orch_output = orch.process_tick(spot_ltp, now_ist)
         boundary_event = orch.finalize_boundary(now_ist)
         active_event = boundary_event or orch_output.get("event")
 
         raw_engine_action = active_event["action"] if active_event else "NO TRADE"
         engine_status = active_event["status"] if active_event else "WAITING_BAR_CLOSE"
-        rsi_14 = active_event["rsi"] if active_event and active_event["rsi"] else 50.0
+
+        # NO FAKE 50.0 RSI: Strictly use real calculated value, else None
+        rsi_14 = active_event.get("rsi") if active_event else None
         macro_trend = active_event["macro"] if active_event else "STANDBY"
         cooldown_left = active_event["cooldown"] if active_event else 0
 
@@ -450,10 +488,10 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
-        # 3. INTERNAL STRIKE EVALUATION & DELTA EXTRACTION
+        # 4. INTERNAL STRIKE EVALUATION & DELTA EXTRACTION
         best_candidate = None
         scan_diag = {}
-        if chain_data:
+        if chain_data and oi_diag.get("status") not in ("DATA_UNAVAILABLE", "STALE_DATA"):
             scan_dir = market_dir if market_dir != MarketDirection.NEUTRAL else MarketDirection.BULLISH
             best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
                 chain_data=chain_data,
@@ -461,11 +499,13 @@ if "access_token" in st.session_state:
                 trend_score=75.0
             )
 
-        current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 16.50
+        current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
         raw_cand_delta = best_candidate.get("abs_delta", 0.0) if best_candidate else 0.0
 
-        # 4. DYNAMIC ADAPTIVE CONFIRMATION RULES (Fast = 2, Slow = 3)
-        is_fast_momentum = (rsi_14 >= 60.0 or rsi_14 <= 40.0) or (realized_vol >= 15.0)
+        # 5. ADAPTIVE STABILITY FILTER (Fast Move = 2, Slow Move = 3)
+        is_fast_momentum = False
+        if rsi_14 is not None:
+            is_fast_momentum = (rsi_14 >= 60.0 or rsi_14 <= 40.0) or (realized_vol >= 15.0)
         required_confirmations = 2 if is_fast_momentum else 3
 
         passed_gate = False
@@ -474,8 +514,17 @@ if "access_token" in st.session_state:
         cand_state = None
         is_candidate_ready = False
 
-        # Pre-Alert & Execution Tracking
-        if best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
+        # STALE/INCOMPLETE DATA FAIL-CLOSED GATE CHECKS
+        bars_ready = len(orch.agg.bars_5m) >= 2 and len(orch.agg.bars_15m) >= 1
+        oi_verified = oi_diag.get("status") in ("BULLISH_CONFIRMATION", "BEARISH_CONFIRMATION")
+
+        if not bars_ready:
+            gate_msg = "INSUFFICIENT_COMPLETED_BARS"
+        elif oi_diag.get("status") == "DATA_UNAVAILABLE":
+            gate_msg = "FAIL_CLOSED_OI_STALE"
+
+        # Pre-Alert & Execution Tracking (Only when clean data pipeline is verified)
+        if bars_ready and best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             cand_state, is_candidate_ready = st.session_state["candidate_tracker"].process_candidate(
                 symbol=cand_sym,
@@ -488,8 +537,8 @@ if "access_token" in st.session_state:
                 required_confirmations=required_confirmations
             )
 
-        # 5. ZERO-TRUST SAFETY GATE (Executes when Engine triggers BUY CE/PE)
-        if raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
+        # 6. ZERO-TRUST SAFETY GATE EXECUTION
+        if bars_ready and oi_verified and raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             exact_tte = calculate_precise_tte(active_expiry)
             live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
@@ -539,7 +588,7 @@ if "access_token" in st.session_state:
             best_opt_display = "AWAITING SIGNAL..."
             tracked_contract = "AWAITING SIGNAL..."
 
-        # ================= ACCURATE DYNAMIC STABILITY LOGIC =================
+        # ================= DYNAMIC STABILITY PROGRESS =================
         current_confirmations = cand_state.confirmations if cand_state else 0
         speed_tag = "Fast" if is_fast_momentum else "Slow"
 
@@ -549,20 +598,31 @@ if "access_token" in st.session_state:
         elif raw_engine_action in ("BUY CE", "BUY PE"):
             stability_str = f"{current_confirmations}/{required_confirmations} Confirming ({speed_tag} Move)"
             stability_color = "#f1c40f"
-        elif market_dir != MarketDirection.NEUTRAL:
+        elif market_dir != MarketDirection.NEUTRAL and bars_ready:
             stability_str = f"{current_confirmations}/{required_confirmations} Tracking (Pre-Alert - {speed_tag})"
             stability_color = "#64ffda"
         else:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # Delta Display Formatting for Horizontal Strip
+        # Delta Display Formatting
         if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
         else:
             delta_display_str = "--"
             delta_display_color = "#848d9c"
+
+        # RSI Formatting (Strictly avoid fake 50.0)
+        if rsi_14 is not None:
+            rsi_display_str = f"{rsi_14:.1f}"
+            rsi_display_color = "#64ffda"
+        else:
+            rsi_display_str = "--"
+            rsi_display_color = "#848d9c"
+
+        # Realized Vol Formatting
+        vol_display_str = f"{realized_vol:.1f}%" if realized_vol > 0.0 else "--"
 
         # ================= UI LAYOUT =================
         col_metric, col_signal_card = st.columns([2, 1])
@@ -572,7 +632,6 @@ if "access_token" in st.session_state:
             regime_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else ("#e74c3c" if market_dir == MarketDirection.BEARISH else "#e67e22")
             trend_focus = f"MOMENTUM {market_dir.value}" if market_dir != MarketDirection.NEUTRAL else "STANDBY / AVOID CHOP"
 
-            # PREDICTIVE PRE-ALERT BADGE
             if market_dir == MarketDirection.BULLISH:
                 pre_alert_badge = (
                     f'<div class="pre-alert-bullish">'
@@ -592,7 +651,8 @@ if "access_token" in st.session_state:
                     f'</div>'
                 )
 
-            pcr_display = f"{oi_diag.get('pcr', 1.0):.2f}" if oi_diag.get('pcr') else "1.00"
+            pcr_raw = oi_diag.get("pcr")
+            pcr_display = f"{pcr_raw:.2f}" if pcr_raw is not None else "--"
             oi_status = oi_diag.get("status", "STANDBY")
             oi_status_color = "#2ecc71" if "BULLISH" in oi_status else ("#e74c3c" if "BEARISH" in oi_status else "#f1c40f")
 
@@ -608,13 +668,13 @@ if "access_token" in st.session_state:
                 </div>
                 {pre_alert_badge}
                 <div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px; display:flex; justify-content:space-between;">
-                    <span>ℹ️ Cooldown: <b>{cooldown_left} bars</b> | Bars: 1m={len(orch.agg.bars_1m)}, 5m={len(orch.agg.bars_5m)}, 15m={len(orch.agg.bars_15m)}</span>
+                    <span>ℹ️ Cooldown: <b>{cooldown_left} bars</b> | Completed: <b>1m={len(orch.agg.bars_1m)}, 5m={len(orch.agg.bars_5m)}, 15m={len(orch.agg.bars_15m)}</b></span>
                     <span>OI Gate: <b style="color:{oi_status_color};">{oi_status}</b> (PCR: <b>{pcr_display}</b>)</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            # 7-COLUMN UNIFIED METRICS STRIP (WITH DELTA COLUMN)
+            # 7-COLUMN METRICS STRIP (WITH DELTA & REAL METRICS)
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
                 f'<div style="flex: 1.1; border-right: 1px solid #233554; padding-right: 6px;">'
@@ -623,7 +683,7 @@ if "access_token" in st.session_state:
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">RSI (14)</div>'
-                f'<div style="color:#64ffda; font-size:17px; font-weight:700; margin-top:2px;">{rsi_14:.1f}</div>'
+                f'<div style="color:{rsi_display_color}; font-size:17px; font-weight:700; margin-top:2px;">{rsi_display_str}</div>'
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Delta (Δ)</div>'
@@ -635,7 +695,7 @@ if "access_token" in st.session_state:
                 f'</div>'
                 f'<div style="flex: 0.9; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Realized Vol</div>'
-                f'<div style="color:#ccd6f6; font-size:17px; font-weight:700; margin-top:2px;">{realized_vol:.1f}%</div>'
+                f'<div style="color:#ccd6f6; font-size:17px; font-weight:700; margin-top:2px;">{vol_display_str}</div>'
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Cooldown</div>'
@@ -643,7 +703,7 @@ if "access_token" in st.session_state:
                 f'</div>'
                 f'<div style="flex: 1.1; text-align:right; padding-left: 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Engine State</div>'
-                f'<div style="color:#64ffda; font-size:12px; font-weight:700; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{engine_status[:15]}</div>'
+                f'<div style="color:#64ffda; font-size:12px; font-weight:700; margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">{gate_msg[:16]}</div>'
                 f'</div>'
                 f'</div>'
             )
@@ -657,11 +717,11 @@ if "access_token" in st.session_state:
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
             # Trend Score strictly locked to confirmed signal or active pre-alert
-            if raw_engine_action in ("BUY CE", "BUY PE"):
+            if raw_engine_action in ("BUY CE", "BUY PE") and passed_gate:
                 score_ratio = "8/10"
                 score_val = 85.0
                 score_color = "#2ecc71"
-            elif market_dir != MarketDirection.NEUTRAL:
+            elif market_dir != MarketDirection.NEUTRAL and bars_ready:
                 score_ratio = "6/10"
                 score_val = 65.0
                 score_color = "#f1c40f"
