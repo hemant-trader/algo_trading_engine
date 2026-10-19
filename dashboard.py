@@ -26,6 +26,13 @@ from engine.telemetry_logger import HeadlessObservationLogger
 # Wire Hardened Institutional Core Engine with Fail-Closed OI Gate
 from engine_core import EngineOrchestrator
 
+# Safe Import for Shadow Momentum Engine (Hybrid Observability Layer)
+try:
+    from processing.shadow_momentum import ShadowMomentumEngine
+    SHADOW_AVAILABLE = True
+except ImportError:
+    SHADOW_AVAILABLE = False
+
 st.set_page_config(page_title="Hemant Algo Trading Engine", layout="wide")
 
 TOKEN_FILE = "access_token.json"
@@ -64,6 +71,15 @@ if "seq_counter" not in st.session_state:
     st.session_state["seq_counter"] = 1000
 if "bootstrapped_indices" not in st.session_state:
     st.session_state["bootstrapped_indices"] = set()
+
+# Shadow Momentum State Tracking
+if "shadow_engine" not in st.session_state:
+    if SHADOW_AVAILABLE:
+        st.session_state["shadow_engine"] = ShadowMomentumEngine(log_dir="logs")
+    else:
+        st.session_state["shadow_engine"] = None
+if "last_shadow_alert" not in st.session_state:
+    st.session_state["last_shadow_alert"] = None
 
 # Daily Signal Counters
 if "daily_call_count" not in st.session_state:
@@ -136,13 +152,15 @@ def get_option_chain_data(instrument_key, expiry_date, token):
 
 
 def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, token: str):
-    """Bootstrap strictly today's intraday bars from 09:15 AM IST to avoid cold-start and multiday pollution."""
+    """
+    Bootstrap strictly today's intraday bars from 09:15 AM IST using Upstox intraday endpoint.
+    Prevents both cold-start freeze and multiday candle pollution.
+    """
     encoded_key = urllib.parse.quote(instrument_key)
     now_dt = datetime.datetime.now(IST)
-    today_str = now_dt.strftime("%Y-%m-%d")
     market_open_dt = datetime.datetime(now_dt.year, now_dt.month, now_dt.day, 9, 15, 0, tzinfo=IST)
     
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}"
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
     headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -152,17 +170,17 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
                 candles = data["data"]["candles"]
                 candles.reverse()  # Chronological order: oldest to newest
                 
-                # Filter strictly today's intraday session bars starting 09:15 AM
                 valid_candles = []
                 for c in candles:
                     ts = datetime.datetime.fromisoformat(c[0]).astimezone(IST)
                     if ts >= market_open_dt and ts.date() == now_dt.date():
                         valid_candles.append((ts, float(c[4])))
                 
-                for ts, close_p in valid_candles:
-                    orch.process_tick(close_p, ts)
-                    orch.finalize_boundary(ts)
-                return True
+                if valid_candles:
+                    for ts, close_p in valid_candles:
+                        orch.process_tick(close_p, ts)
+                        orch.finalize_boundary(ts)
+                    return True
     except Exception:
         pass
     return False
@@ -461,6 +479,12 @@ if "access_token" in st.session_state:
 
         realized_vol = calculate_realized_volatility(st.session_state["price_history"])
 
+        # Feed spot tick to experimental shadow engine (Passive Observation)
+        if st.session_state.get("shadow_engine"):
+            shadow_event = st.session_state["shadow_engine"].push_tick(spot_ltp, now_ist)
+            if shadow_event:
+                st.session_state["last_shadow_alert"] = shadow_event
+
         # 2. OPTION CHAIN SNAPSHOT WITH FAIL-CLOSED STALE CHECK
         chain_data = None
         oi_diag = {"status": "INITIALIZING", "pcr": None, "reason": "AWAITING_CHAIN"}
@@ -685,7 +709,7 @@ if "access_token" in st.session_state:
 
             # 7-COLUMN METRICS STRIP (WITH DELTA & REAL METRICS)
             metrics_strip_html = (
-                f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:12px;">'
+                f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:10px;">'
                 f'<div style="flex: 1.1; border-right: 1px solid #233554; padding-right: 6px;">'
                 f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">{selected_index} Spot</div>'
                 f'<div style="color:#ffffff; font-size:17px; font-weight:700; white-space:nowrap; margin-top:2px;">₹{spot_ltp:,.2f}</div>'
@@ -717,6 +741,18 @@ if "access_token" in st.session_state:
                 f'</div>'
             )
             st.markdown(metrics_strip_html, unsafe_allow_html=True)
+
+            # Experimental Shadow Early-Warning Observation Badge
+            active_sh = st.session_state.get("last_shadow_alert")
+            if active_sh and (time.time() - active_sh.get("trigger_epoch", 0.0) < 90.0):
+                sh_color = "#2ecc71" if "BULLISH" in active_sh.get("type", "") else "#e74c3c"
+                st.markdown(f"""
+                <div style="background-color:#0d1520; border:1px dashed {sh_color}; border-radius:6px; padding:6px 12px; margin-bottom:12px; font-size:11px; display:flex; justify-content:space-between; align-items:center;">
+                    <span style="color:#8892b0;">🧪 <b>SHADOW EARLY-WARNING:</b> <b style="color:{sh_color};">{active_sh.get('type')}</b> @ ₹{active_sh.get('spot', 0.0):.1f} (Vel: {active_sh.get('velocity', 0.0)} pts/s, Accel: {active_sh.get('accel', 0.0)})</span>
+                    <span style="color:#ccd6f6;">MFE: <b style="color:#2ecc71;">+{active_sh.get('max_favorable', 0.0)} pts</b> | MAE: <b style="color:#e74c3c;">{active_sh.get('max_adverse', 0.0)} pts</b> (Telemetry Active)</span>
+                </div>
+                """, unsafe_allow_html=True)
+
             st.line_chart(pd.DataFrame(st.session_state["price_history"], columns=["Spot Price"]))
 
         # ================= SIGNAL CARD =================
