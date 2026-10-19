@@ -136,9 +136,12 @@ def get_option_chain_data(instrument_key, expiry_date, token):
 
 
 def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, token: str):
-    """Upstox API se aaj ke closed 1m bars fetch karke aggregator ko bootstrap karta hai."""
+    """Bootstrap strictly today's intraday bars from 09:15 AM IST to avoid cold-start and multiday pollution."""
     encoded_key = urllib.parse.quote(instrument_key)
-    today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
+    now_dt = datetime.datetime.now(IST)
+    today_str = now_dt.strftime("%Y-%m-%d")
+    market_open_dt = datetime.datetime(now_dt.year, now_dt.month, now_dt.day, 9, 15, 0, tzinfo=IST)
+    
     url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}"
     headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
     try:
@@ -147,10 +150,16 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
             data = res.json()
             if data.get("status") == "success" and "data" in data and "candles" in data["data"]:
                 candles = data["data"]["candles"]
-                candles.reverse()  # Chronological order
+                candles.reverse()  # Chronological order: oldest to newest
+                
+                # Filter strictly today's intraday session bars starting 09:15 AM
+                valid_candles = []
                 for c in candles:
                     ts = datetime.datetime.fromisoformat(c[0]).astimezone(IST)
-                    close_p = float(c[4])
+                    if ts >= market_open_dt and ts.date() == now_dt.date():
+                        valid_candles.append((ts, float(c[4])))
+                
+                for ts, close_p in valid_candles:
                     orch.process_tick(close_p, ts)
                     orch.finalize_boundary(ts)
                 return True
