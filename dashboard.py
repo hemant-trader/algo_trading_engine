@@ -224,12 +224,15 @@ def calculate_realized_volatility(price_history, bars_1m=None):
     return 0.0
 
 
-def extract_strict_atm_candidate(chain_data, spot_ltp, step_size, target_dir=MarketDirection.BULLISH):
-    """Strictly picks the nearest At-The-Money (ATM) contract to ensure Delta is near ~0.50."""
+def extract_strict_atm_candidate(chain_data, spot_ltp, step_size, target_dir=MarketDirection.BULLISH, tte=0.005):
+    """
+    Dynamically selects the nearest ATM contract and calculates 
+    LIVE Black-Scholes Delta (eliminates static 0.50 freeze).
+    """
     if not chain_data or spot_ltp <= 0:
         return None
 
-    # Calculate exact ATM strike
+    # Calculate exact ATM strike based on spot
     atm_strike = round(spot_ltp / step_size) * step_size
     target_opt_type = "call_options" if target_dir != MarketDirection.BEARISH else "put_options"
     enum_opt_type = OptionType.CE if target_dir != MarketDirection.BEARISH else OptionType.PE
@@ -242,14 +245,30 @@ def extract_strict_atm_candidate(chain_data, spot_ltp, step_size, target_dir=Mar
     strike = float(best_row.get("strike_price", atm_strike))
     ltp = float(market_data.get("ltp", 0.0) or 0.0)
     inst_key = opt_data.get("instrument_key", "")
-    iv_pct = float(opt_data.get("option_greeks", {}).get("iv", 0.0) or 25.0)
+    
+    # Read IV or compute realistic default
+    iv_pct = float(opt_data.get("option_greeks", {}).get("iv", 0.0) or 0.0)
+    if iv_pct <= 0.0:
+        iv_pct = 24.5
+    iv_dec = max(0.08, iv_pct / 100.0 if iv_pct > 1.0 else iv_pct)
 
-    # Estimate clean ATM Black-Scholes Delta (Call ~ +0.50, Put ~ 0.50 absolute)
-    abs_delta = 0.50
-    if target_dir == MarketDirection.BEARISH:
-        symbol = f"{int(strike)} PE"
-    else:
-        symbol = f"{int(strike)} CE"
+    # LIVE Black-Scholes Delta calculation
+    try:
+        bs_greeks = BlackScholesEngine.calculate_greeks(
+            spot=spot_ltp,
+            strike=strike,
+            tte=max(0.001, tte),
+            rate=0.07,
+            vol=iv_dec,
+            option_type=enum_opt_type
+        )
+        calculated_delta = abs(bs_greeks.delta)
+    except Exception:
+        # Fallback approximation based on moneyness if formula fails
+        moneyness = (spot_ltp - strike) / strike if enum_opt_type == OptionType.CE else (strike - spot_ltp) / strike
+        calculated_delta = min(0.65, max(0.38, 0.50 + moneyness * 2.0))
+
+    symbol = f"{int(strike)} PE" if target_dir == MarketDirection.BEARISH else f"{int(strike)} CE"
 
     return {
         "symbol": symbol,
@@ -257,8 +276,8 @@ def extract_strict_atm_candidate(chain_data, spot_ltp, step_size, target_dir=Mar
         "option_type": enum_opt_type,
         "snapshot_ltp": ltp,
         "instrument_key": inst_key,
-        "iv_decimal": iv_pct / 100.0 if iv_pct > 1.0 else iv_pct,
-        "abs_delta": abs_delta,
+        "iv_decimal": iv_dec,
+        "abs_delta": round(calculated_delta, 2),
         "score": 85.0
     }
 
@@ -583,15 +602,17 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
-        # 4. STRICT ATM STRIKE SELECTION & DELTA EXTRACTION
+        # 4. STRICT ATM STRIKE SELECTION & DYNAMIC DELTA EXTRACTION
+        exact_tte = calculate_precise_tte(active_expiry) if active_expiry else 0.005
         best_candidate = None
         if chain_data:
-            # Strictly select the Nearest ATM contract based on current spot and trend
+            # Strictly select Nearest ATM contract with REAL Black-Scholes Delta
             best_candidate = extract_strict_atm_candidate(
                 chain_data=chain_data,
                 spot_ltp=spot_ltp,
                 step_size=step_size,
-                target_dir=market_dir
+                target_dir=market_dir,
+                tte=exact_tte
             )
 
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
@@ -635,7 +656,6 @@ if "access_token" in st.session_state:
         # 6. ZERO-TRUST SAFETY GATE (BID-ASK SPREAD + LIQUIDITY + GREEKS VALIDATION)
         if bars_ready and oi_verified and raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-            exact_tte = calculate_precise_tte(active_expiry)
             live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
                 instrument_key=best_candidate["instrument_key"],
                 symbol=cand_sym,
@@ -706,13 +726,13 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # ATM Delta Display Formatting: Shows clean ATM Delta
+        # ATM Delta Display Formatting: Shows clean dynamic ATM Delta
         if raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
         else:
-            delta_display_str = "0.50"
-            delta_display_color = "#64ffda"
+            delta_display_str = "--"
+            delta_display_color = "#848d9c"
 
         # Live Wilder RSI Formatting
         if rsi_14 is not None:
@@ -796,7 +816,7 @@ if "access_token" in st.session_state:
             </div>
             """, unsafe_allow_html=True)
 
-            # 7-COLUMN METRICS STRIP (WITH STRICT ATM DELTA & REAL METRICS)
+            # 7-COLUMN METRICS STRIP (WITH STRICT DYNAMIC ATM DELTA & REAL METRICS)
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:10px;">'
                 f'<div style="flex: 1.1; border-right: 1px solid #233554; padding-right: 6px;">'
