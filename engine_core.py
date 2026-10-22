@@ -1,6 +1,7 @@
 """
 engine_core.py - Institutional Sensex/Nifty Directional Engine
 Updated & Hardened:
+- Resilient Network Jitter / Feed Gap Handling (Threshold = 300s, Recovery = 1 bar)
 - Pre-Market (09:00 - 09:15 AM) Sentiment & Discovery Tracking
 - Continuous Real-Time Tick Event Evaluation (No 5m Bar-Close Blackout)
 - Realistic Intraday Warmup Thresholds (Pre-Session Seeded: 5m >= 4 bars)
@@ -205,7 +206,7 @@ class CooldownStateMachine:
 
 
 # ============================================================================
-# 3. CANDLE AGGREGATOR (PRE-MARKET 09:00 AM COMPATIBLE)
+# 3. CANDLE AGGREGATOR (PRE-MARKET & NETWORK JITTER TOLERANT)
 # ============================================================================
 class CandleAggregator:
     def __init__(
@@ -213,8 +214,8 @@ class CandleAggregator:
         max_1m_bars: int = 150,
         max_5m_bars: int = 100,
         max_15m_bars: int = 60,
-        gap_threshold_seconds: float = 75.0,
-        consecutive_recovery_needed_5m: int = 2
+        gap_threshold_seconds: float = 300.0,      # 5 mins jitter allowance prevents false FEED_OUTAGE
+        consecutive_recovery_needed_5m: int = 1    # Immediate unblock upon receiving continuous clean bar
     ):
         self.max_1m_bars = max_1m_bars
         self.max_5m_bars = max_5m_bars
@@ -641,7 +642,7 @@ class SignalEngine:
 # ============================================================================
 class EngineOrchestrator:
     def __init__(self, mandatory_oi_gate: bool = True):
-        self.agg = CandleAggregator(consecutive_recovery_needed_5m=2)
+        self.agg = CandleAggregator(consecutive_recovery_needed_5m=1)
         self.engine = SignalEngine(
             rsi_period=14,
             atr_period=14,
