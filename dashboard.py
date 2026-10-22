@@ -149,16 +149,10 @@ def get_option_chain_data(instrument_key, expiry_date, token):
 
 
 def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, token: str):
-    """
-    Pre-Session Seed Bootstrap:
-    Loads previous day closing bars + today's morning bars.
-    Guarantees that EMAs, Volatility, and RSI are fully stabilized early.
-    """
     encoded_key = urllib.parse.quote(instrument_key)
     now_dt = datetime.datetime.now(IST)
     today_str = now_dt.strftime("%Y-%m-%d")
 
-    # Primary: Upstox intraday endpoint
     url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
     headers = {"accept": "application/json", "Authorization": f"Bearer {token}"}
     candles = []
@@ -169,7 +163,6 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
             if data.get("status") == "success" and "data" in data and "candles" in data["data"]:
                 candles = data["data"]["candles"]
 
-        # Fallback to historical endpoint if intraday returns empty
         if not candles:
             fallback_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}"
             f_res = requests.get(fallback_url, headers=headers, timeout=5)
@@ -179,7 +172,7 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
                     candles = f_data["data"]["candles"]
 
         if candles:
-            candles.reverse()  # Oldest to newest
+            candles.reverse()
             seed_bars = candles[-60:] if len(candles) >= 60 else candles
             for c in seed_bars:
                 ts = datetime.datetime.fromisoformat(c[0]).astimezone(IST)
@@ -544,38 +537,33 @@ if "access_token" in st.session_state:
             market_dir = MarketDirection.NEUTRAL
 
         # ====================================================================
-        # 4. STRICT DIRECTIONAL ATM CANDIDATE SCANNER (ELIMINATES INVERSION & PENNY OTMs)
+        # 4. RESOLUTION: ATM CANDIDATE (TRACKED) vs BEST OTM CANDIDATE (DISPLAY)
         # ====================================================================
-        best_candidate = None
+        atm_candidate = None
+        best_otm_candidate = None
         exact_tte = calculate_precise_tte(active_expiry) if active_expiry else 0.005
 
         if chain_data:
             step_size = INDEX_CONFIG[selected_index]["step"]
             atm_strike = round(spot_ltp / step_size) * step_size
 
-            # Enforce strict directional option side: Bullish = only CE, Bearish = only PE
+            # Inversion Guard: Bullish = CE, Bearish = PE
             if market_dir == MarketDirection.BEARISH:
                 target_key = "put_options"
                 enum_type = OptionType.PE
+                # OTM for PE is strictly 1 to 2 strikes below spot
+                target_otm_strike = atm_strike - step_size
             else:
-                # Default to CE in Bullish or Neutral mode to prevent inversions
                 target_key = "call_options"
                 enum_type = OptionType.CE
+                # OTM for CE is strictly 1 to 2 strikes above spot
+                target_otm_strike = atm_strike + step_size
 
-            valid_candidates = []
             for row in chain_data:
                 strike_p = float(row.get("strike_price", 0.0))
-                # Only allow contracts within 2 strikes of ATM spot (e.g. within 200 points)
-                if abs(strike_p - atm_strike) > (step_size * 2):
-                    continue
-
                 opt_info = row.get(target_key, {})
                 m_data = opt_info.get("market_data", {})
                 ltp_val = float(m_data.get("ltp", 0.0) or 0.0)
-
-                # Reject dead penny contracts (LTP must be >= ₹5.0)
-                if ltp_val < 5.0:
-                    continue
 
                 greeks_data = opt_info.get("option_greeks", {})
                 delta_val = abs(float(greeks_data.get("delta", 0.0) or 0.0))
@@ -584,7 +572,6 @@ if "access_token" in st.session_state:
                     iv_val = 24.5
                 iv_dec = max(0.08, iv_val / 100.0 if iv_val > 1.0 else iv_val)
 
-                # Real Black-Scholes calculation if broker delta is unavailable
                 if delta_val <= 0.05:
                     try:
                         greeks = BlackScholesEngine.calculate_greeks(
@@ -597,10 +584,10 @@ if "access_token" in st.session_state:
                         )
                         delta_val = abs(greeks.delta)
                     except Exception:
-                        delta_val = max(0.38, min(0.65, 0.50 - (abs(strike_p - spot_ltp) / (step_size * 10))))
+                        delta_val = 0.50
 
                 type_label = "CE" if enum_type == OptionType.CE else "PE"
-                valid_candidates.append({
+                candidate_payload = {
                     "symbol": f"{int(strike_p)}_{type_label}",
                     "strike": strike_p,
                     "option_type": enum_type,
@@ -608,15 +595,35 @@ if "access_token" in st.session_state:
                     "instrument_key": opt_info.get("instrument_key", ""),
                     "iv_decimal": min(1.2, iv_dec),
                     "abs_delta": round(delta_val, 2),
-                    "score": 85.0,
-                    "distance": abs(strike_p - atm_strike)
-                })
+                    "score": 85.0
+                }
 
-            # Sort strictly by proximity to ATM (Closest strike first, then highest premium)
-            if valid_candidates:
-                valid_candidates.sort(key=lambda x: (x["distance"], -x["snapshot_ltp"]))
-                best_candidate = valid_candidates[0]
+                # Nearest ATM selection (for execution and Delta validation)
+                if strike_p == atm_strike:
+                    atm_candidate = candidate_payload
+                # Best OTM selection (1 strike out of the money)
+                if strike_p == target_otm_strike:
+                    best_otm_candidate = candidate_payload
 
+            # Fallbacks if exact row was absent
+            if not atm_candidate and chain_data:
+                nearest_row = min(chain_data, key=lambda x: abs(float(x.get("strike_price", 0.0)) - atm_strike))
+                stk = float(nearest_row.get("strike_price", atm_strike))
+                atm_candidate = {
+                    "symbol": f"{int(stk)}_{'CE' if enum_type == OptionType.CE else 'PE'}",
+                    "strike": stk,
+                    "option_type": enum_type,
+                    "snapshot_ltp": float(nearest_row.get(target_key, {}).get("market_data", {}).get("ltp", 0.0) or 0.0),
+                    "instrument_key": nearest_row.get(target_key, {}).get("instrument_key", ""),
+                    "iv_decimal": 0.25,
+                    "abs_delta": 0.50,
+                    "score": 85.0
+                }
+            if not best_otm_candidate:
+                best_otm_candidate = atm_candidate
+
+        # Candidate used for Zero-Trust Gate is strictly ATM Candidate
+        best_candidate = atm_candidate
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
         raw_cand_delta = best_candidate.get("abs_delta", 0.0) if best_candidate else 0.0
 
@@ -641,7 +648,7 @@ if "access_token" in st.session_state:
         elif oi_diag.get("status") == "DATA_UNAVAILABLE":
             gate_msg = "FAIL_CLOSED_OI_STALE"
 
-        # Pre-Alert & Execution Tracking
+        # Pre-Alert & Execution Tracking (Enforced on ATM Candidate)
         if bars_ready and best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             cand_state, is_candidate_ready = st.session_state["candidate_tracker"].process_candidate(
@@ -655,7 +662,7 @@ if "access_token" in st.session_state:
                 required_confirmations=required_confirmations
             )
 
-        # 6. ZERO-TRUST SAFETY GATE (BID-ASK SPREAD + LIQUIDITY + GREEKS VALIDATION)
+        # 6. ZERO-TRUST SAFETY GATE (BID-ASK SPREAD + LIQUIDITY + GREEKS VALIDATION ON ATM)
         if bars_ready and oi_verified and raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
@@ -697,21 +704,21 @@ if "access_token" in st.session_state:
                             st.session_state["daily_put_count"] += 1
                         st.session_state["last_counted_action"] = unique_key
 
-        # ================= STRIKE REVEAL POLICY =================
-        if raw_engine_action in ("BUY CE", "BUY PE") and best_candidate:
-            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
-            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-        elif market_dir != MarketDirection.NEUTRAL and best_candidate:
-            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
-            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-        elif best_candidate:
-            best_opt_display = f"{best_candidate['symbol']} (₹{best_candidate['snapshot_ltp']:.1f})"
-            tracked_contract = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
+        # ====================================================================
+        # 7. STRICT DISPLAY POLICY: OTM IN CANDIDATE, ATM IN TRACKED CONTRACT
+        # ====================================================================
+        # Display triggers ONLY during valid Pre-Alert or Active Signal
+        is_pre_alert_active = (market_dir != MarketDirection.NEUTRAL and bars_ready and raw_engine_action != "NO TRADE")
+        is_signal_active = (raw_engine_action in ("BUY CE", "BUY PE"))
+
+        if (is_signal_active or is_pre_alert_active) and best_otm_candidate and atm_candidate:
+            best_opt_display = f"{best_otm_candidate['symbol']} (₹{best_otm_candidate['snapshot_ltp']:.1f})"
+            tracked_contract = f"{selected_index.replace(' ', '')}_{atm_candidate['symbol']} (ATM)"
         else:
             best_opt_display = "AWAITING SIGNAL..."
             tracked_contract = "AWAITING SIGNAL..."
 
-        # ================= SAFE STABILITY PROGRESS (FIX FOR ATTRIBUTEERROR) =================
+        # ================= SAFE STABILITY PROGRESS =================
         current_confirmations = getattr(cand_state, "confirmations", getattr(cand_state, "confirmation_count", 0)) if cand_state else 0
         speed_tag = "Fast" if is_fast_momentum else "Slow"
 
@@ -728,7 +735,7 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # Delta Display Formatting (Candidate dynamic delta)
+        # Delta Display Formatting (Live ATM candidate delta)
         if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
@@ -779,13 +786,13 @@ if "access_token" in st.session_state:
                         f'⚪ <b>PRE-MARKET: FLAT OPENING EXPECTED</b> | Waiting for 09:15 AM Regular Session Volume'
                         f'</div>'
                     )
-            elif market_dir == MarketDirection.BULLISH:
+            elif market_dir == MarketDirection.BULLISH and raw_engine_action != "NO TRADE":
                 pre_alert_badge = (
                     f'<div class="pre-alert-bullish">'
                     f'⚡ <b>PRE-ALERT: BULLISH MOMENTUM DETECTED</b> | Win Probability: <b>88%</b> | Model Accuracy: <b>92%</b>'
                     f'</div>'
                 )
-            elif market_dir == MarketDirection.BEARISH:
+            elif market_dir == MarketDirection.BEARISH and raw_engine_action != "NO TRADE":
                 pre_alert_badge = (
                     f'<div class="pre-alert-bearish">'
                     f'⚡ <b>PRE-ALERT: BEARISH BREAKDOWN DETECTED</b> | Win Probability: <b>88%</b> | Model Accuracy: <b>92%</b>'
@@ -810,7 +817,7 @@ if "access_token" in st.session_state:
                     <div style="color:{regime_color}; font-size:15px; font-weight:bold; margin-top:2px;">⏳ {regime_title}</div></div>
                     <div style="text-align:center;"><span style="color:#8892b0; font-size:11px;">TREND FOCUS</span>
                     <div style="color:#ccd6f6; font-size:13px; font-weight:bold; margin-top:2px;">{trend_focus}</div></div>
-                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST CANDIDATE</span>
+                    <div style="text-align:right;"><span style="color:#8892b0; font-size:11px;">🎯 BEST CANDIDATE (OTM)</span>
                     <div style="color:#64ffda; font-size:13px; font-weight:bold; margin-top:2px;">{best_opt_display}</div></div>
                 </div>
                 {pre_alert_badge}
@@ -856,7 +863,6 @@ if "access_token" in st.session_state:
             )
             st.markdown(metrics_strip_html, unsafe_allow_html=True)
 
-            # Experimental Shadow Early-Warning Observation Badge
             active_sh = st.session_state.get("last_shadow_alert")
             if active_sh and (time.time() - active_sh.get("trigger_epoch", 0.0) < 90.0):
                 sh_color = "#2ecc71" if "BULLISH" in active_sh.get("type", "") else "#e74c3c"
@@ -875,7 +881,6 @@ if "access_token" in st.session_state:
             gate_badge = "PASSED" if passed_gate else "BLOCKED"
             gate_badge_color = "#2ecc71" if passed_gate else "#e74c3c"
 
-            # Trend Score strictly locked to confirmed signal or active pre-alert
             if raw_engine_action in ("BUY CE", "BUY PE") and passed_gate:
                 score_ratio = "8/10"
                 score_val = 85.0
