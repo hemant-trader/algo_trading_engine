@@ -543,16 +543,79 @@ if "access_token" in st.session_state:
         else:
             market_dir = MarketDirection.NEUTRAL
 
-        # 4. INTERNAL STRIKE EVALUATION & DELTA EXTRACTION (ORIGINAL SCANNER LOGIC)
+        # ====================================================================
+        # 4. STRICT DIRECTIONAL ATM CANDIDATE SCANNER (ELIMINATES INVERSION & PENNY OTMs)
+        # ====================================================================
         best_candidate = None
-        scan_diag = {}
-        if chain_data and oi_diag.get("status") not in ("DATA_UNAVAILABLE", "STALE_DATA"):
-            scan_dir = market_dir if market_dir != MarketDirection.NEUTRAL else MarketDirection.BULLISH
-            best_candidate, scan_diag = st.session_state["candidate_scanner"].scan_and_rank_best_candidate(
-                chain_data=chain_data,
-                direction=scan_dir,
-                trend_score=75.0
-            )
+        exact_tte = calculate_precise_tte(active_expiry) if active_expiry else 0.005
+
+        if chain_data:
+            step_size = INDEX_CONFIG[selected_index]["step"]
+            atm_strike = round(spot_ltp / step_size) * step_size
+
+            # Enforce strict directional option side: Bullish = only CE, Bearish = only PE
+            if market_dir == MarketDirection.BEARISH:
+                target_key = "put_options"
+                enum_type = OptionType.PE
+            else:
+                # Default to CE in Bullish or Neutral mode to prevent inversions
+                target_key = "call_options"
+                enum_type = OptionType.CE
+
+            valid_candidates = []
+            for row in chain_data:
+                strike_p = float(row.get("strike_price", 0.0))
+                # Only allow contracts within 2 strikes of ATM spot (e.g. within 200 points)
+                if abs(strike_p - atm_strike) > (step_size * 2):
+                    continue
+
+                opt_info = row.get(target_key, {})
+                m_data = opt_info.get("market_data", {})
+                ltp_val = float(m_data.get("ltp", 0.0) or 0.0)
+
+                # Reject dead penny contracts (LTP must be >= ₹5.0)
+                if ltp_val < 5.0:
+                    continue
+
+                greeks_data = opt_info.get("option_greeks", {})
+                delta_val = abs(float(greeks_data.get("delta", 0.0) or 0.0))
+                iv_val = float(greeks_data.get("iv", 0.0) or 0.0)
+                if iv_val <= 0.0:
+                    iv_val = 24.5
+                iv_dec = max(0.08, iv_val / 100.0 if iv_val > 1.0 else iv_val)
+
+                # Real Black-Scholes calculation if broker delta is unavailable
+                if delta_val <= 0.05:
+                    try:
+                        greeks = BlackScholesEngine.calculate_greeks(
+                            spot=spot_ltp,
+                            strike=strike_p,
+                            tte=max(0.001, exact_tte),
+                            rate=0.07,
+                            vol=iv_dec,
+                            option_type=enum_type
+                        )
+                        delta_val = abs(greeks.delta)
+                    except Exception:
+                        delta_val = max(0.38, min(0.65, 0.50 - (abs(strike_p - spot_ltp) / (step_size * 10))))
+
+                type_label = "CE" if enum_type == OptionType.CE else "PE"
+                valid_candidates.append({
+                    "symbol": f"{int(strike_p)}_{type_label}",
+                    "strike": strike_p,
+                    "option_type": enum_type,
+                    "snapshot_ltp": ltp_val,
+                    "instrument_key": opt_info.get("instrument_key", ""),
+                    "iv_decimal": min(1.2, iv_dec),
+                    "abs_delta": round(delta_val, 2),
+                    "score": 85.0,
+                    "distance": abs(strike_p - atm_strike)
+                })
+
+            # Sort strictly by proximity to ATM (Closest strike first, then highest premium)
+            if valid_candidates:
+                valid_candidates.sort(key=lambda x: (x["distance"], -x["snapshot_ltp"]))
+                best_candidate = valid_candidates[0]
 
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
         raw_cand_delta = best_candidate.get("abs_delta", 0.0) if best_candidate else 0.0
@@ -595,7 +658,6 @@ if "access_token" in st.session_state:
         # 6. ZERO-TRUST SAFETY GATE (BID-ASK SPREAD + LIQUIDITY + GREEKS VALIDATION)
         if bars_ready and oi_verified and raw_engine_action in ("BUY CE", "BUY PE") and active_expiry and chain_data and best_candidate:
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
-            exact_tte = calculate_precise_tte(active_expiry)
             live_quote, q_msg = st.session_state["quote_provider"].fetch_execution_quote(
                 instrument_key=best_candidate["instrument_key"],
                 symbol=cand_sym,
@@ -666,7 +728,7 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # Delta Display Formatting (Pehle jaisa candidate delta)
+        # Delta Display Formatting (Candidate dynamic delta)
         if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
