@@ -152,7 +152,7 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
     """
     Pre-Session Seed Bootstrap:
     Loads previous day closing bars + today's morning bars.
-    Guarantees that EMAs, Volatility, and RSI are fully stabilized at 09:18 AM.
+    Guarantees that EMAs, Volatility, and RSI are fully stabilized early.
     """
     encoded_key = urllib.parse.quote(instrument_key)
     now_dt = datetime.datetime.now(IST)
@@ -169,7 +169,7 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
             if data.get("status") == "success" and "data" in data and "candles" in data["data"]:
                 candles = data["data"]["candles"]
 
-        # Fallback to historical endpoint if intraday returns empty (early morning session)
+        # Fallback to historical endpoint if intraday returns empty
         if not candles:
             fallback_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}"
             f_res = requests.get(fallback_url, headers=headers, timeout=5)
@@ -180,7 +180,6 @@ def bootstrap_historical_candles(orch: EngineOrchestrator, instrument_key: str, 
 
         if candles:
             candles.reverse()  # Oldest to newest
-            # Seed last 60 completed bars (carries T-1 memory + today)
             seed_bars = candles[-60:] if len(candles) >= 60 else candles
             for c in seed_bars:
                 ts = datetime.datetime.fromisoformat(c[0]).astimezone(IST)
@@ -204,16 +203,27 @@ def calculate_precise_tte(expiry_str):
         return 0.005
 
 
-def calculate_realized_volatility(price_history):
-    if len(price_history) < 10:
-        return 0.0
-    s = pd.Series(price_history)
-    log_returns = np.log(s / s.shift(1)).dropna()
-    std = log_returns.std()
-    if np.isnan(std) or std == 0:
-        return 0.0
-    annualized_vol = float(std * np.sqrt(252 * 375 * 12) * 100.0)
-    return round(max(5.0, min(annualized_vol, 45.0)), 2)
+def calculate_realized_volatility(price_history, bars_1m=None):
+    # Primary: Spot tick buffer
+    if len(price_history) >= 10:
+        s = pd.Series(price_history)
+        log_returns = np.log(s / s.shift(1)).dropna()
+        std = log_returns.std()
+        if not np.isnan(std) and std > 0:
+            annualized_vol = float(std * np.sqrt(252 * 375 * 12) * 100.0)
+            return round(max(5.0, min(annualized_vol, 45.0)), 2)
+
+    # Fallback: 1-minute closed bars
+    if bars_1m and len(bars_1m) >= 10:
+        closes = [float(b["close"]) for b in bars_1m[-30:]]
+        s = pd.Series(closes)
+        log_returns = np.log(s / s.shift(1)).dropna()
+        std = log_returns.std()
+        if not np.isnan(std) and std > 0:
+            annualized_vol = float(std * np.sqrt(252 * 375) * 100.0)
+            return round(max(5.0, min(annualized_vol, 45.0)), 2)
+
+    return 0.0
 
 
 saved_token_data = load_token_from_file()
@@ -485,7 +495,8 @@ if "access_token" in st.session_state:
         if len(st.session_state["price_history"]) > 100:
             st.session_state["price_history"].pop(0)
 
-        realized_vol = calculate_realized_volatility(st.session_state["price_history"])
+        # Multi-Period Realized Volatility Calculation
+        realized_vol = calculate_realized_volatility(st.session_state["price_history"], orch.agg.bars_1m)
 
         # Feed spot tick to experimental shadow engine (Passive Observation)
         if st.session_state.get("shadow_engine"):
@@ -511,13 +522,20 @@ if "access_token" in st.session_state:
         # 3. FEED LIVE TICK TO ENGINE ORCHESTRATOR (REAL-TIME EVALUATION)
         orch_output = orch.process_tick(spot_ltp, now_ist)
         boundary_event = orch.finalize_boundary(now_ist)
-        active_event = boundary_event or orch_output.get("event")
+        # CRITICAL FIX: Live tick output gets priority over stale boundary event
+        active_event = orch_output.get("event") or boundary_event
 
         raw_engine_action = active_event["action"] if active_event else "NO TRADE"
         engine_status = active_event["status"] if active_event else "WAITING_BAR_CLOSE"
 
-        # Continuous Live Wilder RSI
+        # Continuous Live Wilder RSI: Calculated directly from 1m closed bars
         rsi_14 = active_event.get("rsi") if active_event else None
+        if len(orch.agg.bars_1m) >= 14:
+            closes_1m = [float(b["close"]) for b in orch.agg.bars_1m]
+            direct_rsi = orch.engine.calculate_wilder_rsi(closes_1m, 14)
+            if direct_rsi is not None:
+                rsi_14 = direct_rsi
+
         macro_trend = active_event["macro"] if active_event else "STANDBY"
         cooldown_left = active_event["cooldown"] if active_event else 0
 
@@ -555,7 +573,7 @@ if "access_token" in st.session_state:
         cand_state = None
         is_candidate_ready = False
 
-        # Pre-Seeded bars ensure readiness early from 09:18 AM
+        # Pre-Seeded bars ensure readiness early
         bars_ready = len(orch.agg.bars_5m) >= 2 or len(orch.agg.bars_1m) >= 10
         oi_verified = oi_diag.get("status") in ("BULLISH_CONFIRMATION", "BEARISH_CONFIRMATION", "STANDBY")
 
@@ -649,10 +667,13 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # Delta Display Formatting (Active during Pre-Alert or Active Signal)
+        # Delta Display Formatting: Active during Pre-Alert or Active Signal
         if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
+        elif best_candidate and raw_cand_delta > 0.0:
+            delta_display_str = f"{raw_cand_delta:.2f}"
+            delta_display_color = "#8892b0"
         else:
             delta_display_str = "--"
             delta_display_color = "#848d9c"
