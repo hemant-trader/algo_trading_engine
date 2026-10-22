@@ -1,11 +1,12 @@
 """
 engine_core.py - Institutional Sensex/Nifty Directional Engine
 Updated & Hardened:
+- Anti-Trap Price Action Slope Guard (Strictly blocks BUY CE during rapid price drops)
+- Hard RSI Dynamic Thresholds (CE: >= 55.0, PE: <= 45.0)
 - Resilient Network Jitter / Feed Gap Handling (Threshold = 300s, Recovery = 1 bar)
 - Pre-Market (09:00 - 09:15 AM) Sentiment & Discovery Tracking
 - Continuous Real-Time Tick Event Evaluation (No 5m Bar-Close Blackout)
 - Realistic Intraday Warmup Thresholds (Pre-Session Seeded: 5m >= 4 bars)
-- Accurate Wilder RSI Live Streaming
 - Resilient OI Confirmation with PCR Macro-Tolerance
 """
 
@@ -448,7 +449,7 @@ class CandleAggregator:
 
 
 # ============================================================================
-# 4. SIGNAL ENGINE WITH ACTIVE RSI EVALUATION
+# 4. SIGNAL ENGINE WITH ANTI-TRAP SLOPE & RSI EVALUATION
 # ============================================================================
 class SignalEngine:
     def __init__(
@@ -595,8 +596,28 @@ class SignalEngine:
             diag["cooldown_remaining"] = sm_d["cooldown_remaining"]
             return action, diag
 
-        bullish = (ema9_5m > ema21_5m) and (ema9_15m >= ema21_15m)
-        bearish = (ema9_5m < ema21_5m) and (ema9_15m <= ema21_15m)
+        # ====================================================================
+        # ANTI-TRAP PRICE ACTION SLOPE GUARD
+        # Checks immediate micro-trend to prevent buying CE into falling knives
+        # ====================================================================
+        recent_drop = False
+        recent_rise = False
+        curr_spot = closes_1m[-1]
+
+        if len(closes_1m) >= 3:
+            # Drop detected if price fell consecutively or broke sharply below EMA9
+            recent_drop = (closes_1m[-1] < closes_1m[-2] < closes_1m[-3]) or (curr_spot < ema9_5m - 10.0)
+            # Rise detected if price gained consecutively or broke sharply above EMA9
+            recent_rise = (closes_1m[-1] > closes_1m[-2] > closes_1m[-3]) or (curr_spot > ema9_5m + 10.0)
+
+        # Baseline EMA confluence
+        bullish_ema = (ema9_5m > ema21_5m) and (ema9_15m >= ema21_15m)
+        bearish_ema = (ema9_5m < ema21_5m) and (ema9_15m <= ema21_15m)
+
+        # Hard Block: Bullish consensus CANNOT exist if price is actively dropping
+        bullish = bullish_ema and not recent_drop and (curr_spot >= ema9_5m)
+        # Hard Block: Bearish consensus CANNOT exist if price is actively rising
+        bearish = bearish_ema and not recent_rise and (curr_spot <= ema9_5m)
 
         if not (bullish or bearish):
             diag["status"] = "SIDEWAYS / CHOPPY"
@@ -608,11 +629,12 @@ class SignalEngine:
 
         diag["macro_trend"] = "BULLISH" if bullish else "BEARISH"
 
+        # Strict Momentum Trigger: Requires RSI Expansion (CE >= 55.0, PE <= 45.0)
         candidate = "NO TRADE"
-        if bullish and (rsi_1m is not None and rsi_1m >= 54.0):
+        if bullish and (rsi_1m is not None and rsi_1m >= 55.0):
             candidate = "BUY CE"
             diag["status"] = "CONFIRMED_BULLISH_EXPANSION"
-        elif bearish and (rsi_1m is not None and rsi_1m <= 46.0):
+        elif bearish and (rsi_1m is not None and rsi_1m <= 45.0):
             candidate = "BUY PE"
             diag["status"] = "CONFIRMED_BEARISH_EXPANSION"
         else:
