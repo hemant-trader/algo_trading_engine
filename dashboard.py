@@ -516,6 +516,8 @@ if "access_token" in st.session_state:
 
         raw_engine_action = active_event["action"] if active_event else "NO TRADE"
         engine_status = active_event["status"] if active_event else "WAITING_BAR_CLOSE"
+        is_pre_alert = active_event.get("is_pre_alert", False) if active_event else False
+        live_vwap = active_event.get("vwap") if active_event else None
 
         # Continuous Live Wilder RSI: Calculated directly from 1m closed bars
         rsi_14 = active_event.get("rsi") if active_event else None
@@ -551,12 +553,10 @@ if "access_token" in st.session_state:
             if market_dir == MarketDirection.BEARISH:
                 target_key = "put_options"
                 enum_type = OptionType.PE
-                # OTM for PE is strictly 1 to 2 strikes below spot
                 target_otm_strike = atm_strike - step_size
             else:
                 target_key = "call_options"
                 enum_type = OptionType.CE
-                # OTM for CE is strictly 1 to 2 strikes above spot
                 target_otm_strike = atm_strike + step_size
 
             for row in chain_data:
@@ -598,14 +598,11 @@ if "access_token" in st.session_state:
                     "score": 85.0
                 }
 
-                # Nearest ATM selection (for execution and Delta validation)
                 if strike_p == atm_strike:
                     atm_candidate = candidate_payload
-                # Best OTM selection (1 strike out of the money)
                 if strike_p == target_otm_strike:
                     best_otm_candidate = candidate_payload
 
-            # Fallbacks if exact row was absent
             if not atm_candidate and chain_data:
                 nearest_row = min(chain_data, key=lambda x: abs(float(x.get("strike_price", 0.0)) - atm_strike))
                 stk = float(nearest_row.get("strike_price", atm_strike))
@@ -622,12 +619,11 @@ if "access_token" in st.session_state:
             if not best_otm_candidate:
                 best_otm_candidate = atm_candidate
 
-        # Candidate used for Zero-Trust Gate is strictly ATM Candidate
         best_candidate = atm_candidate
         current_iv_pct = (best_candidate["iv_decimal"] * 100.0) if best_candidate else 0.0
         raw_cand_delta = best_candidate.get("abs_delta", 0.0) if best_candidate else 0.0
 
-        # 5. ADAPTIVE STABILITY FILTER (Fast Move = 2, Slow Move = 3)
+        # 5. ADAPTIVE STABILITY FILTER
         is_fast_momentum = False
         if rsi_14 is not None:
             is_fast_momentum = (rsi_14 >= 60.0 or rsi_14 <= 40.0) or (realized_vol >= 14.0)
@@ -639,7 +635,6 @@ if "access_token" in st.session_state:
         cand_state = None
         is_candidate_ready = False
 
-        # Pre-Seeded bars ensure readiness early
         bars_ready = len(orch.agg.bars_5m) >= 2 or len(orch.agg.bars_1m) >= 10
         oi_verified = oi_diag.get("status") in ("BULLISH_CONFIRMATION", "BEARISH_CONFIRMATION", "STANDBY")
 
@@ -648,7 +643,6 @@ if "access_token" in st.session_state:
         elif oi_diag.get("status") == "DATA_UNAVAILABLE":
             gate_msg = "FAIL_CLOSED_OI_STALE"
 
-        # Pre-Alert & Execution Tracking (Enforced on ATM Candidate)
         if bars_ready and best_candidate and (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")):
             cand_sym = f"{selected_index.replace(' ', '')}_{best_candidate['symbol']}"
             cand_state, is_candidate_ready = st.session_state["candidate_tracker"].process_candidate(
@@ -707,9 +701,8 @@ if "access_token" in st.session_state:
         # ====================================================================
         # 7. STRICT DISPLAY POLICY: OTM IN CANDIDATE, ATM IN TRACKED CONTRACT
         # ====================================================================
-        # Display triggers ONLY during valid Pre-Alert or Active Signal
-        is_pre_alert_active = (market_dir != MarketDirection.NEUTRAL and bars_ready and raw_engine_action != "NO TRADE")
         is_signal_active = (raw_engine_action in ("BUY CE", "BUY PE"))
+        is_pre_alert_active = is_pre_alert or (market_dir != MarketDirection.NEUTRAL and bars_ready and raw_engine_action != "NO TRADE")
 
         if (is_signal_active or is_pre_alert_active) and best_otm_candidate and atm_candidate:
             best_opt_display = f"{best_otm_candidate['symbol']} (₹{best_otm_candidate['snapshot_ltp']:.1f})"
@@ -735,7 +728,7 @@ if "access_token" in st.session_state:
             stability_str = f"0/{required_confirmations} Standby (No Signal)"
             stability_color = "#848d9c"
 
-        # Delta Display Formatting (Live ATM candidate delta)
+        # Delta Display Formatting
         if (market_dir != MarketDirection.NEUTRAL or raw_engine_action in ("BUY CE", "BUY PE")) and raw_cand_delta > 0.0:
             delta_display_str = f"{raw_cand_delta:.2f}"
             delta_display_color = "#2ecc71"
@@ -765,7 +758,7 @@ if "access_token" in st.session_state:
             regime_color = "#2ecc71" if market_dir == MarketDirection.BULLISH else ("#e74c3c" if market_dir == MarketDirection.BEARISH else "#e67e22")
             trend_focus = f"MOMENTUM {market_dir.value}" if market_dir != MarketDirection.NEUTRAL else "STANDBY / AVOID CHOP"
 
-            # PRE-MARKET (09:00 - 09:15 AM) & REGULAR SESSION PRE-ALERT BADGE
+            # PRE-MARKET & REGULAR SESSION PRE-ALERT BADGE
             is_pre_market = now_ist.time() < datetime.time(9, 15, 0)
             if is_pre_market:
                 if market_dir == MarketDirection.BULLISH:
@@ -786,16 +779,16 @@ if "access_token" in st.session_state:
                         f'⚪ <b>PRE-MARKET: FLAT OPENING EXPECTED</b> | Waiting for 09:15 AM Regular Session Volume'
                         f'</div>'
                     )
-            elif market_dir == MarketDirection.BULLISH and raw_engine_action != "NO TRADE":
+            elif (is_pre_alert or is_signal_active) and market_dir == MarketDirection.BULLISH:
                 pre_alert_badge = (
                     f'<div class="pre-alert-bullish">'
-                    f'⚡ <b>PRE-ALERT: BULLISH MOMENTUM DETECTED</b> | Win Probability: <b>88%</b> | Model Accuracy: <b>92%</b>'
+                    f'⚡ <b>ADVANCE PRE-ALERT: BULLISH EXPANSION IN PROGRESS</b> | Target Expiry: <b>{active_expiry}</b> | Momentum High'
                     f'</div>'
                 )
-            elif market_dir == MarketDirection.BEARISH and raw_engine_action != "NO TRADE":
+            elif (is_pre_alert or is_signal_active) and market_dir == MarketDirection.BEARISH:
                 pre_alert_badge = (
                     f'<div class="pre-alert-bearish">'
-                    f'⚡ <b>PRE-ALERT: BEARISH BREAKDOWN DETECTED</b> | Win Probability: <b>88%</b> | Model Accuracy: <b>92%</b>'
+                    f'⚡ <b>ADVANCE PRE-ALERT: BEARISH BREAKDOWN IN PROGRESS</b> | Target Expiry: <b>{active_expiry}</b> | Momentum High'
                     f'</div>'
                 )
             else:
@@ -809,6 +802,7 @@ if "access_token" in st.session_state:
             pcr_display = f"{pcr_raw:.2f}" if pcr_raw is not None else "--"
             oi_status = oi_diag.get("status", "STANDBY")
             oi_status_color = "#2ecc71" if "BULLISH" in oi_status else ("#e74c3c" if "BEARISH" in oi_status else "#f1c40f")
+            vwap_display = f"₹{live_vwap:,.1f}" if live_vwap else "--"
 
             st.markdown(f"""
             <div style="background-color:#161f30; padding:14px 18px; border-radius:10px; border:1px solid #233554; margin-bottom:14px;">
@@ -823,12 +817,12 @@ if "access_token" in st.session_state:
                 {pre_alert_badge}
                 <div style="color:#64ffda; font-size:11px; margin-top:8px; border-top:1px solid #1d2d44; padding-top:6px; display:flex; justify-content:space-between;">
                     <span>ℹ️ Cooldown: <b>{cooldown_left} bars</b> | Completed: <b>1m={len(orch.agg.bars_1m)}, 5m={len(orch.agg.bars_5m)}, 15m={len(orch.agg.bars_15m)}</b></span>
-                    <span>OI Gate: <b style="color:{oi_status_color};">{oi_status}</b> (PCR: <b>{pcr_display}</b>)</span>
+                    <span>VWAP: <b style="color:#ffffff;">{vwap_display}</b> | OI Gate: <b style="color:{oi_status_color};">{oi_status}</b> (PCR: <b>{pcr_display}</b>)</span>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            # 7-COLUMN METRICS STRIP (WITH REAL CANDIDATE DELTA & REAL METRICS)
+            # 7-COLUMN METRICS STRIP
             metrics_strip_html = (
                 f'<div style="display:flex; justify-content:space-between; align-items:center; background-color:#111622; padding:12px 14px; border-radius:10px; border:1px solid #1f293d; margin-bottom:10px;">'
                 f'<div style="flex: 1.1; border-right: 1px solid #233554; padding-right: 6px;">'
@@ -840,7 +834,7 @@ if "access_token" in st.session_state:
                 f'<div style="color:{rsi_display_color}; font-size:17px; font-weight:700; margin-top:2px;">{rsi_display_str}</div>'
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
-                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">Delta (Δ)</div>'
+                f'<div style="color:#8892b0; font-size:10px; font-weight:600; text-transform:uppercase;">ATM Delta (Δ)</div>'
                 f'<div style="color:{delta_display_color}; font-size:17px; font-weight:700; margin-top:2px;">{delta_display_str}</div>'
                 f'</div>'
                 f'<div style="flex: 0.8; text-align:center; border-right: 1px solid #233554; padding: 0 6px;">'
@@ -885,7 +879,7 @@ if "access_token" in st.session_state:
                 score_ratio = "8/10"
                 score_val = 85.0
                 score_color = "#2ecc71"
-            elif market_dir != MarketDirection.NEUTRAL and bars_ready:
+            elif (is_pre_alert or is_pre_alert_active) and bars_ready:
                 score_ratio = "6/10"
                 score_val = 65.0
                 score_color = "#f1c40f"
