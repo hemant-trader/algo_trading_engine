@@ -1,13 +1,11 @@
 """
 engine_core.py - Institutional Sensex/Nifty Directional Engine
-Updated & Hardened:
-- Anti-Trap Price Action Slope Guard (Strictly blocks BUY CE during rapid price drops)
-- Hard RSI Dynamic Thresholds (CE: >= 55.0, PE: <= 45.0)
-- Resilient Network Jitter / Feed Gap Handling (Threshold = 300s, Recovery = 1 bar)
-- Pre-Market (09:00 - 09:15 AM) Sentiment & Discovery Tracking
-- Continuous Real-Time Tick Event Evaluation (No 5m Bar-Close Blackout)
-- Realistic Intraday Warmup Thresholds (Pre-Session Seeded: 5m >= 4 bars)
-- Resilient OI Confirmation with PCR Macro-Tolerance
+Updated & Production Hardened:
+- Instant Signal Invalidation Guard (Completely kills stale/sticky BUY CE on market drops)
+- Fast Intraday VWAP + Micro-Breakdown Engine (Early PE detection without 15m EMA lag)
+- High-Confluence Advance Pre-Alert (Detects strong momentum midway through 5m bar)
+- Change-in-OI (Delta OI) Priority over Static PCR
+- Strict Time & Gap Resiliency
 """
 
 import datetime
@@ -20,12 +18,12 @@ import pandas as pd
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 # ============================================================================
-# 1. FAIL-CLOSED OI / PCR CONFIRMATION ENGINE
+# 1. FAIL-CLOSED OI & DELTA FLOW ENGINE
 # ============================================================================
 class OIConfirmationEngine:
     """
-    Completed-data-only, change-based OI & PCR Confirmation Gate.
-    Evaluates institutional positioning delta across consecutive finalized snapshots.
+    Evaluates institutional positioning delta across finalized snapshots.
+    Prioritizes real-time change in OI over static/laggy PCR values.
     """
     def __init__(self, max_stale_seconds: float = 300.0, mandatory_gate: bool = True):
         self.max_stale_seconds = max_stale_seconds
@@ -46,7 +44,7 @@ class OIConfirmationEngine:
         if age < 0.0 or age > self.max_stale_seconds:
             return {
                 "status": "DATA_UNAVAILABLE",
-                "reason": f"STALE_OR_FUTURE_SNAPSHOT (Age: {age:.1f}s)",
+                "reason": f"STALE_SNAPSHOT (Age: {age:.1f}s)",
                 "pcr": None,
                 "delta_ce_oi": 0,
                 "delta_pe_oi": 0
@@ -89,13 +87,12 @@ class OIConfirmationEngine:
             "pcr": current_pcr
         }
 
-        # First snapshot establishes baseline
         if self.last_snapshot is None:
             self.last_snapshot = current_record
             init_status = "BULLISH_CONFIRMATION" if current_pcr >= 1.20 else ("BEARISH_CONFIRMATION" if current_pcr <= 0.85 else "STANDBY")
             return {
                 "status": init_status,
-                "reason": "INITIALIZING_BASELINE_ESTABLISHED",
+                "reason": "BASELINE_ESTABLISHED",
                 "pcr": current_pcr,
                 "delta_ce_oi": 0,
                 "delta_pe_oi": 0
@@ -107,13 +104,13 @@ class OIConfirmationEngine:
 
         self.last_snapshot = current_record
 
-        # Change-Based Confirmation Rules (with PCR macro tolerance)
-        if (delta_pe_oi > delta_ce_oi and delta_price >= -20.0) or (current_pcr >= 1.25 and delta_price >= 0.0):
+        # Change-Based Confirmation Rules
+        if (delta_pe_oi > delta_ce_oi and delta_price >= -25.0) or (current_pcr >= 1.25 and delta_price >= 0.0):
             status = "BULLISH_CONFIRMATION"
-            reason = "PUT_BUILDUP_AND_PRICE_SUPPORT"
-        elif (delta_ce_oi > delta_pe_oi and delta_price <= 20.0) or (current_pcr <= 0.85 and delta_price <= 0.0):
+            reason = "PUT_BUILDUP_SUPPORT"
+        elif (delta_ce_oi > delta_pe_oi and delta_price <= 25.0) or (current_pcr <= 0.85 and delta_price <= 0.0):
             status = "BEARISH_CONFIRMATION"
-            reason = "CALL_BUILDUP_AND_PRICE_RESISTANCE"
+            reason = "CALL_BUILDUP_RESISTANCE"
         else:
             status = "STANDBY"
             reason = f"BALANCED_FLOW (PCR: {current_pcr})"
@@ -128,9 +125,13 @@ class OIConfirmationEngine:
 
 
 # ============================================================================
-# 2. PURE COOLDOWN STATE MACHINE
+# 2. HARDENED COOLDOWN STATE MACHINE (WITH INSTANT INVALIDATION)
 # ============================================================================
 class CooldownStateMachine:
+    """
+    Prevents sticky signals. If an existing signal is invalidated by immediate price action,
+    it forcefully resets memory to NO TRADE instantly.
+    """
     def __init__(self, cooldown_bars: int = 2):
         self.cooldown_bars = cooldown_bars
         self.cooldown_remaining_bars = 0
@@ -146,7 +147,21 @@ class CooldownStateMachine:
         self.last_processed_bar_epoch = None
         self.epoch_committed_cache.clear()
 
-    def process_candidate(self, candidate_signal: str, bar_epoch: float) -> Tuple[str, Dict]:
+    def invalidate_signal(self, reason: str = "PRICE_ACTION_INVALIDATION"):
+        """Forcefully clears any active signal freeze."""
+        self.last_emitted_signal = "NO TRADE"
+        self.cooldown_remaining_bars = 0
+
+    def process_candidate(self, candidate_signal: str, bar_epoch: float, is_invalidated: bool = False) -> Tuple[str, Dict]:
+        # Handle Instant Invalidation: If market reversed, kill existing signal immediately
+        if is_invalidated:
+            self.invalidate_signal()
+            return "NO TRADE", {
+                "status": "SIGNAL_FORCE_INVALIDATED",
+                "is_new_signal_event": False,
+                "cooldown_remaining": 0
+            }
+
         if self.last_processed_bar_epoch is not None:
             if bar_epoch < self.last_processed_bar_epoch:
                 return "NO TRADE", {
@@ -154,15 +169,6 @@ class CooldownStateMachine:
                     "is_new_signal_event": False,
                     "cooldown_remaining": self.cooldown_remaining_bars
                 }
-            if bar_epoch == self.last_processed_bar_epoch:
-                cached_action, cached_diag = self.epoch_committed_cache.get(
-                    bar_epoch, 
-                    ("NO TRADE", {"status": "STATIC_RERUN_PRESERVED", "is_new_signal_event": False, "cooldown_remaining": self.cooldown_remaining_bars})
-                )
-                diag_copy = dict(cached_diag)
-                diag_copy["status"] = "STATIC_RERUN_PRESERVED"
-                diag_copy["is_new_signal_event"] = False
-                return cached_action, diag_copy
 
         starting_cooldown = self.cooldown_remaining_bars
         action = "NO TRADE"
@@ -172,6 +178,7 @@ class CooldownStateMachine:
         if candidate_signal == "NO TRADE":
             action = "NO TRADE"
             status = "NO_SIGNAL_CANDIDATE"
+            self.last_emitted_signal = "NO TRADE"
         elif candidate_signal == self.last_emitted_signal:
             action = self.last_emitted_signal
             status = "SAME_SIGNAL_HOLDING"
@@ -207,7 +214,7 @@ class CooldownStateMachine:
 
 
 # ============================================================================
-# 3. CANDLE AGGREGATOR (PRE-MARKET & NETWORK JITTER TOLERANT)
+# 3. CANDLE AGGREGATOR (MULTI-TIMEFRAME STREAMING)
 # ============================================================================
 class CandleAggregator:
     def __init__(
@@ -215,8 +222,8 @@ class CandleAggregator:
         max_1m_bars: int = 150,
         max_5m_bars: int = 100,
         max_15m_bars: int = 60,
-        gap_threshold_seconds: float = 300.0,      # 5 mins jitter allowance prevents false FEED_OUTAGE
-        consecutive_recovery_needed_5m: int = 1    # Immediate unblock upon receiving continuous clean bar
+        gap_threshold_seconds: float = 300.0,
+        consecutive_recovery_needed_5m: int = 1
     ):
         self.max_1m_bars = max_1m_bars
         self.max_5m_bars = max_5m_bars
@@ -247,7 +254,6 @@ class CandleAggregator:
 
     @staticmethod
     def is_active_session_time(dt: datetime.datetime) -> bool:
-        # Pre-Market analysis 09:00 AM se active hogi (Pre-Open discovery 09:00 - 09:15)
         open_t = dt.replace(hour=9, minute=0, second=0, microsecond=0)
         close_t = dt.replace(hour=15, minute=30, second=0, microsecond=0)
         return open_t <= dt < close_t
@@ -449,7 +455,7 @@ class CandleAggregator:
 
 
 # ============================================================================
-# 4. SIGNAL ENGINE WITH ANTI-TRAP SLOPE & RSI EVALUATION
+# 4. SIGNAL ENGINE (VWAP + ADVANCE PRE-ALERT + FAST BREAKDOWN)
 # ============================================================================
 class SignalEngine:
     def __init__(
@@ -515,6 +521,20 @@ class SignalEngine:
 
         return float(atr)
 
+    @staticmethod
+    def calculate_intraday_vwap(bars_1m: List[Dict]) -> Optional[float]:
+        """Calculates volume-weighted average price (tick approximation if volume unavailable)."""
+        if not bars_1m:
+            return None
+        cum_pv = 0.0
+        cum_v = 0.0
+        for b in bars_1m:
+            typical_price = (b["high"] + b["low"] + b["close"]) / 3.0
+            vol = float(b.get("ticks", 1.0))
+            cum_pv += typical_price * vol
+            cum_v += vol
+        return (cum_pv / cum_v) if cum_v > 0 else bars_1m[-1]["close"]
+
     def evaluate(
         self,
         bars_1m: List[Dict],
@@ -523,22 +543,25 @@ class SignalEngine:
         is_gap_active: bool,
         gap_reason: str,
         oi_diag: Optional[Dict] = None,
-        current_time: Optional[datetime.datetime] = None
+        current_time: Optional[datetime.datetime] = None,
+        running_5m: Optional[Dict] = None
     ) -> Tuple[str, Dict]:
         diag = {
             "macro_trend": "STANDBY",
             "rsi_1m": None,
             "atr_5m": None,
+            "vwap": None,
             "oi_confirmation": oi_diag.get("status") if oi_diag else "NOT_PROVIDED",
             "oi_reason": oi_diag.get("reason") if oi_diag else "NO_SNAPSHOT",
             "status": "MONITORING",
             "is_new_signal_event": False,
+            "is_pre_alert": False,
             "cooldown_remaining": self.cooldown_sm.cooldown_remaining_bars
         }
 
         now = current_time or datetime.datetime.now(IST)
 
-        # PRE-MARKET SENTIMENT DISCOVERY WINDOW (09:00 - 09:15 AM)
+        # Pre-Market discovery window
         if now.time() < datetime.time(9, 15, 0):
             if bars_1m:
                 curr_spot = float(bars_1m[-1]["close"])
@@ -556,7 +579,6 @@ class SignalEngine:
                     diag["status"] = f"PRE_MARKET_FLAT ({diff_pct:.2f}%)"
             return "NO TRADE", diag
 
-        # Calculate live RSI early so UI ALWAYS receives active RSI value
         closes_1m = [float(b["close"]) for b in bars_1m]
         rsi_1m = self.calculate_wilder_rsi(closes_1m, self.rsi_period)
         diag["rsi_1m"] = round(rsi_1m, 1) if rsi_1m is not None else None
@@ -568,79 +590,89 @@ class SignalEngine:
         latest_5m = bars_5m[-1]
         latest_5m_epoch = latest_5m["time"].timestamp()
 
-        # Realistic Warmup (Pre-Session seeded allows starting with 4 bars)
-        if len(bars_5m) < 4 or len(bars_1m) < 14:
-            diag["status"] = f"WARMING_UP (5m:{len(bars_5m)}/4, 1m:{len(bars_1m)}/14)"
+        if len(bars_5m) < 3 or len(bars_1m) < 10:
+            diag["status"] = f"WARMING_UP (5m:{len(bars_5m)}/3, 1m:{len(bars_1m)}/10)"
             return "NO TRADE", diag
+
+        curr_spot = closes_1m[-1]
+        vwap = self.calculate_intraday_vwap(bars_1m)
+        diag["vwap"] = round(vwap, 1) if vwap else None
 
         closes_5m = pd.Series([b["close"] for b in bars_5m], dtype=float)
         ema9_5m = float(closes_5m.ewm(span=9, adjust=False).mean().iloc[-1])
         ema21_5m = float(closes_5m.ewm(span=21, adjust=False).mean().iloc[-1])
 
-        # 15m Alignment
-        if len(bars_15m) >= 2:
-            closes_15m = pd.Series([b["close"] for b in bars_15m], dtype=float)
-            ema9_15m = float(closes_15m.ewm(span=9, adjust=False).mean().iloc[-1])
-            ema21_15m = float(closes_15m.ewm(span=21, adjust=False).mean().iloc[-1])
-        else:
-            ema9_15m = float(closes_5m.ewm(span=18, adjust=False).mean().iloc[-1])
-            ema21_15m = float(closes_5m.ewm(span=42, adjust=False).mean().iloc[-1])
-
         atr_5m = self.calculate_atr(bars_5m, min(len(bars_5m), self.atr_period))
         diag["atr_5m"] = round(atr_5m, 2) if atr_5m is not None else 15.0
 
-        if is_gap_active:
-            diag["status"] = f"BLOCKED: {gap_reason}"
-            action, sm_d = self.cooldown_sm.process_candidate("NO TRADE", latest_5m_epoch)
-            diag["is_new_signal_event"] = sm_d["is_new_signal_event"]
-            diag["cooldown_remaining"] = sm_d["cooldown_remaining"]
-            return action, diag
-
         # ====================================================================
-        # ANTI-TRAP PRICE ACTION SLOPE GUARD
-        # Checks immediate micro-trend to prevent buying CE into falling knives
+        # 1. IMMEDIATE PRICE ACTION & REVERSAL WATCH (KILLS STALE BUY CE)
         # ====================================================================
         recent_drop = False
         recent_rise = False
-        curr_spot = closes_1m[-1]
-
         if len(closes_1m) >= 3:
-            # Drop detected if price fell consecutively or broke sharply below EMA9
-            recent_drop = (closes_1m[-1] < closes_1m[-2] < closes_1m[-3]) or (curr_spot < ema9_5m - 10.0)
-            # Rise detected if price gained consecutively or broke sharply above EMA9
-            recent_rise = (closes_1m[-1] > closes_1m[-2] > closes_1m[-3]) or (curr_spot > ema9_5m + 10.0)
+            recent_drop = (closes_1m[-1] < closes_1m[-2] < closes_1m[-3]) or (vwap and curr_spot < vwap - 10.0)
+            recent_rise = (closes_1m[-1] > closes_1m[-2] > closes_1m[-3]) or (vwap and curr_spot > vwap + 10.0)
 
-        # Baseline EMA confluence
-        bullish_ema = (ema9_5m > ema21_5m) and (ema9_15m >= ema21_15m)
-        bearish_ema = (ema9_5m < ema21_5m) and (ema9_15m <= ema21_15m)
+        # Invalidation Guard: If previous signal was BUY CE but spot is dropping below EMA9/VWAP
+        is_invalidated = False
+        if self.cooldown_sm.last_emitted_signal == "BUY CE" and (curr_spot < ema9_5m or recent_drop):
+            is_invalidated = True
+            self.cooldown_sm.invalidate_signal()
 
-        # Hard Block: Bullish consensus CANNOT exist if price is actively dropping
-        bullish = bullish_ema and not recent_drop and (curr_spot >= ema9_5m)
-        # Hard Block: Bearish consensus CANNOT exist if price is actively rising
-        bearish = bearish_ema and not recent_rise and (curr_spot <= ema9_5m)
-
-        if not (bullish or bearish):
-            diag["status"] = "SIDEWAYS / CHOPPY"
-            diag["macro_trend"] = "STANDBY"
-            action, sm_d = self.cooldown_sm.process_candidate("NO TRADE", latest_5m_epoch)
+        if is_gap_active:
+            diag["status"] = f"BLOCKED: {gap_reason}"
+            action, sm_d = self.cooldown_sm.process_candidate("NO TRADE", latest_5m_epoch, is_invalidated=True)
             diag["is_new_signal_event"] = sm_d["is_new_signal_event"]
             diag["cooldown_remaining"] = sm_d["cooldown_remaining"]
             return action, diag
 
-        diag["macro_trend"] = "BULLISH" if bullish else "BEARISH"
+        # ====================================================================
+        # 2. DUAL-ENGINE CONFLUENCE (5M TREND + FAST VWAP BREAKDOWN)
+        # ====================================================================
+        bullish_structure = (ema9_5m >= ema21_5m) and (curr_spot >= ema9_5m) and not recent_drop
+        if vwap:
+            bullish_structure = bullish_structure and (curr_spot >= vwap)
 
-        # Strict Momentum Trigger: Requires RSI Expansion (CE >= 55.0, PE <= 45.0)
+        # Fast Breakdown: Spot under EMA9 + under VWAP + falling micro-candles
+        bearish_structure = (curr_spot < ema9_5m) and recent_drop
+        if vwap:
+            bearish_structure = bearish_structure and (curr_spot < vwap)
+
+        if bullish_structure:
+            diag["macro_trend"] = "BULLISH"
+        elif bearish_structure:
+            diag["macro_trend"] = "BEARISH"
+        else:
+            diag["macro_trend"] = "STANDBY"
+            diag["status"] = "SIDEWAYS / CHOPPY"
+            action, sm_d = self.cooldown_sm.process_candidate("NO TRADE", latest_5m_epoch, is_invalidated=is_invalidated)
+            diag["is_new_signal_event"] = sm_d["is_new_signal_event"]
+            diag["cooldown_remaining"] = sm_d["cooldown_remaining"]
+            return action, diag
+
+        # ====================================================================
+        # 3. ADVANCE PRE-ALERT (RUNNING 5-MIN CANDLE MID-WAY CHECK)
+        # ====================================================================
+        bar_elapsed_seconds = (now.minute % 5) * 60 + now.second
+        if 150 <= bar_elapsed_seconds <= 260:
+            if diag["macro_trend"] in ("BULLISH", "BEARISH"):
+                diag["is_pre_alert"] = True
+
+        # ====================================================================
+        # 4. MOMENTUM EXPANSION TRIGGER (HIGH-ACCURACY CONFLUENCE)
+        # ====================================================================
         candidate = "NO TRADE"
-        if bullish and (rsi_1m is not None and rsi_1m >= 55.0):
+        if bullish_structure and (rsi_1m is not None and rsi_1m >= 54.0):
             candidate = "BUY CE"
             diag["status"] = "CONFIRMED_BULLISH_EXPANSION"
-        elif bearish and (rsi_1m is not None and rsi_1m <= 45.0):
+        elif bearish_structure and (rsi_1m is not None and rsi_1m <= 46.0):
             candidate = "BUY PE"
             diag["status"] = "CONFIRMED_BEARISH_EXPANSION"
         else:
             diag["status"] = "MOMENTUM_LAG"
 
-        # OI Fail-Closed Gate
+        # OI Filter (Delta OI Flow Check)
         if self.mandatory_oi_gate and candidate in ("BUY CE", "BUY PE"):
             oi_status = oi_diag.get("status") if oi_diag else "DATA_UNAVAILABLE"
             if candidate == "BUY CE" and oi_status not in ("BULLISH_CONFIRMATION", "STANDBY"):
@@ -650,7 +682,7 @@ class SignalEngine:
                 candidate = "NO TRADE"
                 diag["status"] = f"BLOCKED_OI_GATE ({oi_status})"
 
-        action, sm_d = self.cooldown_sm.process_candidate(candidate, latest_5m_epoch)
+        action, sm_d = self.cooldown_sm.process_candidate(candidate, latest_5m_epoch, is_invalidated=is_invalidated)
         diag["is_new_signal_event"] = sm_d["is_new_signal_event"]
         diag["cooldown_remaining"] = sm_d["cooldown_remaining"]
         if sm_d["status"] != "TRANSITION_EMITTED":
@@ -701,7 +733,6 @@ class EngineOrchestrator:
 
         res = self.agg.add_tick(ltp, norm_dt)
 
-        # Real-Time Event Evaluation on every tick
         eval_5m = list(self.agg.bars_5m)
         if self.agg.current_5m:
             eval_5m.append(self.agg.current_5m)
@@ -710,7 +741,8 @@ class EngineOrchestrator:
             self.agg.bars_1m, eval_5m, self.agg.bars_15m,
             self.agg.is_gap_active, self.agg.gap_reason,
             oi_diag=self.latest_oi_diag,
-            current_time=norm_dt
+            current_time=norm_dt,
+            running_5m=self.agg.current_5m
         )
 
         event_payload = {
@@ -719,9 +751,11 @@ class EngineOrchestrator:
             "action": action,
             "macro": diag["macro_trend"],
             "rsi": diag["rsi_1m"],
+            "vwap": diag.get("vwap"),
             "oi_confirm": diag["oi_confirmation"],
             "cooldown": diag["cooldown_remaining"],
             "status": diag["status"],
+            "is_pre_alert": diag.get("is_pre_alert", False),
             "is_event": diag["is_new_signal_event"]
         }
 
@@ -735,7 +769,8 @@ class EngineOrchestrator:
                 self.agg.bars_1m, self.agg.bars_5m, self.agg.bars_15m,
                 self.agg.is_gap_active, self.agg.gap_reason,
                 oi_diag=self.latest_oi_diag,
-                current_time=closed_5m["time"]
+                current_time=closed_5m["time"],
+                running_5m=None
             )
             return {
                 "time": closed_5m["time"],
@@ -743,9 +778,11 @@ class EngineOrchestrator:
                 "action": action,
                 "macro": diag["macro_trend"],
                 "rsi": diag["rsi_1m"],
+                "vwap": diag.get("vwap"),
                 "oi_confirm": diag["oi_confirmation"],
                 "cooldown": diag["cooldown_remaining"],
                 "status": diag["status"],
+                "is_pre_alert": False,
                 "is_event": diag["is_new_signal_event"]
             }
         return None
