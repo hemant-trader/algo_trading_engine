@@ -1,7 +1,7 @@
 """
 engine_core.py - Institutional Sensex/Nifty Directional Engine
 Updated & Production Hardened:
-- Instant Signal Invalidation Guard (Completely kills stale/sticky BUY CE on market drops)
+- Instant Session High Drawdown Cutoff (Kills stale/sticky BUY CE immediately on dumps)
 - Fast Intraday VWAP + Micro-Breakdown Engine (Early PE detection without 15m EMA lag)
 - High-Confluence Advance Pre-Alert (Detects strong momentum midway through 5m bar)
 - Change-in-OI (Delta OI) Priority over Static PCR
@@ -455,7 +455,7 @@ class CandleAggregator:
 
 
 # ============================================================================
-# 4. SIGNAL ENGINE (VWAP + ADVANCE PRE-ALERT + FAST BREAKDOWN)
+# 4. SIGNAL ENGINE (HARD DRAWDOWN CUTOFF + VWAP + FAST BREAKDOWN)
 # ============================================================================
 class SignalEngine:
     def __init__(
@@ -523,7 +523,7 @@ class SignalEngine:
 
     @staticmethod
     def calculate_intraday_vwap(bars_1m: List[Dict]) -> Optional[float]:
-        """Calculates volume-weighted average price (tick approximation if volume unavailable)."""
+        """Calculates true volume-weighted average price across intraday bars."""
         if not bars_1m:
             return None
         cum_pv = 0.0
@@ -606,17 +606,26 @@ class SignalEngine:
         diag["atr_5m"] = round(atr_5m, 2) if atr_5m is not None else 15.0
 
         # ====================================================================
-        # 1. IMMEDIATE PRICE ACTION & REVERSAL WATCH (KILLS STALE BUY CE)
+        # 1. HARD INTRADAY DRAWDOWN GUARD (ZERO-DELAY CE KILL SWITCH)
         # ====================================================================
+        session_high = max([b["high"] for b in bars_1m]) if bars_1m else curr_spot
+        session_low = min([b["low"] for b in bars_1m]) if bars_1m else curr_spot
+        drop_from_high = session_high - curr_spot
+        rally_from_low = curr_spot - session_low
+
+        # Reversal triggers: Drop >= 120 pts from peak or slip under VWAP immediately kills bullish bias
+        is_hard_reversal_down = (drop_from_high >= 120.0)
+        is_hard_reversal_up = (rally_from_low >= 120.0)
+
         recent_drop = False
         recent_rise = False
         if len(closes_1m) >= 3:
-            recent_drop = (closes_1m[-1] < closes_1m[-2] < closes_1m[-3]) or (vwap and curr_spot < vwap - 10.0)
-            recent_rise = (closes_1m[-1] > closes_1m[-2] > closes_1m[-3]) or (vwap and curr_spot > vwap + 10.0)
+            recent_drop = (closes_1m[-1] < closes_1m[-2] < closes_1m[-3]) or (curr_spot < ema9_5m) or is_hard_reversal_down
+            recent_rise = (closes_1m[-1] > closes_1m[-2] > closes_1m[-3]) or (curr_spot > ema9_5m) or is_hard_reversal_up
 
-        # Invalidation Guard: If previous signal was BUY CE but spot is dropping below EMA9/VWAP
+        # Invalidation Guard: Kills BUY CE instantly on dumps
         is_invalidated = False
-        if self.cooldown_sm.last_emitted_signal == "BUY CE" and (curr_spot < ema9_5m or recent_drop):
+        if self.cooldown_sm.last_emitted_signal == "BUY CE" and (curr_spot < ema9_5m or is_hard_reversal_down or recent_drop):
             is_invalidated = True
             self.cooldown_sm.invalidate_signal()
 
@@ -628,15 +637,16 @@ class SignalEngine:
             return action, diag
 
         # ====================================================================
-        # 2. DUAL-ENGINE CONFLUENCE (5M TREND + FAST VWAP BREAKDOWN)
+        # 2. DUAL-ENGINE CONFLUENCE (DYNAMIC TREND RESOLUTION)
         # ====================================================================
-        bullish_structure = (ema9_5m >= ema21_5m) and (curr_spot >= ema9_5m) and not recent_drop
+        # Bullish ONLY if near peak and strictly above EMA9 & VWAP
+        bullish_structure = (ema9_5m >= ema21_5m) and (curr_spot >= ema9_5m) and not is_hard_reversal_down and not recent_drop
         if vwap:
             bullish_structure = bullish_structure and (curr_spot >= vwap)
 
-        # Fast Breakdown: Spot under EMA9 + under VWAP + falling micro-candles
-        bearish_structure = (curr_spot < ema9_5m) and recent_drop
-        if vwap:
+        # Bearish: Triggers immediately on hard drop OR price breakdown below EMA9 + VWAP
+        bearish_structure = (curr_spot < ema9_5m and recent_drop) or is_hard_reversal_down
+        if vwap and not is_hard_reversal_down:
             bearish_structure = bearish_structure and (curr_spot < vwap)
 
         if bullish_structure:
@@ -655,18 +665,18 @@ class SignalEngine:
         # 3. ADVANCE PRE-ALERT (RUNNING 5-MIN CANDLE MID-WAY CHECK)
         # ====================================================================
         bar_elapsed_seconds = (now.minute % 5) * 60 + now.second
-        if 150 <= bar_elapsed_seconds <= 260:
+        if 90 <= bar_elapsed_seconds <= 270:
             if diag["macro_trend"] in ("BULLISH", "BEARISH"):
                 diag["is_pre_alert"] = True
 
         # ====================================================================
-        # 4. MOMENTUM EXPANSION TRIGGER (HIGH-ACCURACY CONFLUENCE)
+        # 4. MOMENTUM EXPANSION TRIGGER
         # ====================================================================
         candidate = "NO TRADE"
         if bullish_structure and (rsi_1m is not None and rsi_1m >= 54.0):
             candidate = "BUY CE"
             diag["status"] = "CONFIRMED_BULLISH_EXPANSION"
-        elif bearish_structure and (rsi_1m is not None and rsi_1m <= 46.0):
+        elif bearish_structure and (rsi_1m is not None and rsi_1m <= 48.0):
             candidate = "BUY PE"
             diag["status"] = "CONFIRMED_BEARISH_EXPANSION"
         else:
